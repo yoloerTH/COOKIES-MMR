@@ -1,0 +1,49 @@
+{
+  "manheimCookies": [
+    {
+      "name": "_cl",
+      "value": "YOUR_CL_COOKIE_VALUE",
+      "domain": ".manheim.com",
+      "path": "/",
+      "httpOnly": false,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "SESSION",
+      "value": "YOUR_SESSION_COOKIE_VALUE",
+      "domain": ".manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": false,
+      "sameSite": "Lax"
+    },
+    {
+      "name": "session",
+      "value": "YOUR_SESSION_COOKIE_VALUE",
+      "domain": "mcom-header-footer.manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    },
+    {
+      "name": "session.sig",
+      "value": "YOUR_SESSION_SIG_VALUE",
+      "domain": "mcom-header-footer.manheim.com",
+      "path": "/",
+      "httpOnly": true,
+      "secure": true,
+      "sameSite": "None"
+    }
+  ],
+  "credentials": {
+    "username": "your@email.com",
+    "password": "yourpassword"
+  },
+  "twoFactorWebhookUrl": "https://n8nsaved-production.up.railway.app/webhook/mmr2facode",
+  "cookieWebhookUrl": "https://n8nsaved-production.up.railway.app/webhook/mmrcookies",
+  "proxyConfiguration": {
+    "useApifyProxy": false
+  }
+}
