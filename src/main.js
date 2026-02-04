@@ -177,6 +177,164 @@ async function find2FAInput(page) {
 }
 
 // ============================================
+// LOGIN FLOW HANDLER
+// ============================================
+
+async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
+    console.log('\n🔐 LOGIN FLOW: Entering credentials...');
+    console.log(`  → Username: ${credentials.username}`);
+
+    // Fill username
+    console.log('  → Filling username field...');
+    await page.fill('input#username', credentials.username);
+    await humanDelay(500, 1000);
+
+    // Fill password
+    console.log('  → Filling password field...');
+    await page.fill('input#password', credentials.password);
+    await humanDelay(500, 1000);
+
+    // Check "Remember my username" if available
+    try {
+        console.log('  → Checking "Remember my username"...');
+        await page.check('input#rememberUsername', { timeout: 2000 });
+        await humanDelay(500, 1000);
+    } catch (e) {
+        console.log('  → Remember username checkbox not found (skipping)');
+    }
+
+    // Find and click submit button
+    console.log('  → Clicking submit button...');
+    const submitButton = await page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")').first();
+    await submitButton.click();
+    console.log('  ✅ Login form submitted');
+
+    // Wait for navigation after login
+    console.log('  → Waiting for page to load after login...');
+    await humanDelay(4000, 6000);
+
+    // Check if 2FA page appeared
+    const is2FAPage = await detect2FAPage(page);
+    if (is2FAPage) {
+        console.log('\n🔐 2FA FLOW: Getting verification code...');
+
+        // Find 2FA input field
+        const twoFAInput = await find2FAInput(page);
+        if (!twoFAInput) {
+            console.error('❌ Could not find 2FA input field!');
+            const screenshot = await page.screenshot({ fullPage: false });
+            await Actor.setValue('2fa-input-not-found-screenshot', screenshot, { contentType: 'image/png' });
+            throw new Error('2FA page detected but input field not found');
+        }
+
+        // Call 2FA webhook and wait for code (2.5 minute timeout)
+        console.log(`  → Calling 2FA webhook: ${twoFactorWebhookUrl}`);
+        console.log('  → Waiting up to 2.5 minutes for your response...');
+
+        let twoFACode = null;
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 150000); // 2.5 minutes
+
+            const twoFAResponse = await fetch(twoFactorWebhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: credentials.username }),
+                signal: controller.signal
+            }).finally(() => clearTimeout(timeoutId));
+
+            if (!twoFAResponse.ok) {
+                const errorText = await twoFAResponse.text().catch(() => 'No error details');
+                throw new Error(`2FA webhook failed with status ${twoFAResponse.status}: ${errorText}`);
+            }
+
+            const responseText = await twoFAResponse.text();
+            console.log(`  → Webhook response received: ${responseText.substring(0, 100)}...`);
+
+            // Parse 2FA code (try JSON first, fallback to plain text)
+            try {
+                const jsonResponse = JSON.parse(responseText);
+                twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
+                console.log('  → Parsed as JSON');
+            } catch (e) {
+                // Not JSON, treat as plain text
+                twoFACode = responseText.trim();
+                console.log('  → Parsed as plain text');
+            }
+
+            if (!twoFACode) {
+                throw new Error('2FA webhook response did not contain a code');
+            }
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error('2FA webhook timed out after 2.5 minutes - no response received');
+            }
+            throw error;
+        }
+
+        console.log(`  ✅ 2FA code received: ${twoFACode}`);
+
+        // Enter 2FA code
+        console.log('  → Entering 2FA code...');
+        await page.fill(twoFAInput, twoFACode);
+        console.log('  ✅ Code entered');
+
+        // Wait for button to become enabled (checkInput() function needs to run)
+        console.log('  → Waiting for Sign In button to become enabled...');
+        await humanDelay(1000, 2000);
+
+        // Find submit button (try multiple selectors)
+        console.log('  → Looking for submit button...');
+        const buttonSelectors = [
+            'button#sign-on',  // Specific to MMR
+            'button:has-text("Sign In")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Submit")',
+            'button:has-text("Verify")',
+            'button:has-text("Continue")'
+        ];
+
+        let twoFASubmit = null;
+        for (const selector of buttonSelectors) {
+            try {
+                const button = page.locator(selector).first();
+                const count = await button.count();
+                if (count > 0) {
+                    twoFASubmit = button;
+                    console.log(`  ✅ Found button: ${selector}`);
+                    break;
+                }
+            } catch (e) {
+                // Try next selector
+            }
+        }
+
+        if (!twoFASubmit) {
+            throw new Error('Could not find 2FA submit button');
+        }
+
+        // Wait for button to be enabled (disabled attribute removed)
+        console.log('  → Waiting for button to be clickable...');
+        await twoFASubmit.waitFor({ state: 'visible', timeout: 10000 });
+
+        // Additional wait to ensure button is enabled
+        await humanDelay(500, 1000);
+
+        // Click submit button
+        console.log('  → Clicking Sign In button...');
+        await twoFASubmit.click({ force: false, timeout: 10000 });
+        console.log('  ✅ 2FA code submitted');
+
+        // Wait for 2FA verification
+        console.log('  → Waiting for 2FA verification...');
+        await humanDelay(4000, 6000);
+    }
+
+    console.log('✅ Login flow completed - session established!');
+}
+
+// ============================================
 // CAPTCHA & ERROR DETECTION
 // ============================================
 
