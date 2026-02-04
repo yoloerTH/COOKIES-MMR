@@ -197,12 +197,41 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
     // Check "Remember my username" if available
     try {
         console.log('  → Checking "Remember my username"...');
-        const checkbox = await page.locator('input#rememberUsername, input[name="pf.rememberUsername"]').first();
-        await checkbox.check({ timeout: 3000 });
-        console.log('  ✅ Remember username checked');
+
+        // Try clicking the label (works for custom-styled checkboxes)
+        const labelSelectors = [
+            'label.remember-username',
+            'label:has-text("Remember my username")',
+            '.ping-checkbox-container:has-text("Remember my username")'
+        ];
+
+        let clicked = false;
+        for (const selector of labelSelectors) {
+            try {
+                const label = page.locator(selector).first();
+                const count = await label.count();
+                if (count > 0) {
+                    await label.click({ timeout: 3000 });
+                    console.log(`  ✅ Remember username checked (clicked ${selector})`);
+                    clicked = true;
+                    break;
+                }
+            } catch (e) {
+                // Try next selector
+            }
+        }
+
+        // Fallback: try checking the input directly with force
+        if (!clicked) {
+            const checkbox = page.locator('input#rememberUsername, input[name="pf.rememberUsername"]').first();
+            await checkbox.check({ timeout: 3000, force: true });
+            console.log('  ✅ Remember username checked (forced)');
+        }
+
         await humanDelay(500, 1000);
     } catch (e) {
-        console.log('  → Remember username checkbox not found (skipping)');
+        console.log('  → Remember username checkbox not found or not clickable (skipping)');
+        console.log(`  → Error: ${e.message}`);
     }
 
     // Find and click submit button (MMR uses <a> tag with id="signOnButton")
