@@ -30,6 +30,6 @@
   ],
   "supabaseEdgeFunctionUrl": "https://nyhpgaksdlmrclraqqmg.supabase.co/functions/v1/get-next-vin",
   "n8nWebhookUrl": "https://n8n-production-0d7d.up.railway.app/webhook/MMR",
-  "maxVINsPerRun": 10,
-  "delayBetweenVINs": [3000, 8000]
+  "maxVINsPerRun": 1,
+  "delayBetweenVINs": [2000, 3000]
 }

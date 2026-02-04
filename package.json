@@ -1,8 +1,8 @@
 {
-  "name": "manheim-cookie-refresher",
+  "name": "manheim-mmr-scraper",
   "version": "1.0.0",
   "type": "module",
-  "description": "Manheim cookie refresher - extracts fresh session cookies daily",
+  "description": "Manheim MMR value scraper with cookie authentication",
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
