@@ -679,9 +679,9 @@ await Actor.main(async () => {
 
         // Check if we landed on a login page instead of MMR tool
         console.log('  → Checking if login is required...');
-        const isLoginPage = await detectLoginPage(mmrPage);
+        const isMMRLoginPage = await detectLoginPage(mmrPage);
 
-        if (isLoginPage) {
+        if (isMMRLoginPage) {
             console.log('  ⚠️ Login page detected in MMR popup - need to authenticate');
 
             // Check if we have credentials
