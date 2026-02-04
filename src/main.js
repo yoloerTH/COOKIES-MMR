@@ -48,21 +48,359 @@ async function simulateHumanScroll(page) {
     await humanDelay(500, 1000);
 }
 
-async function humanTypeVIN(page, selector, vin) {
-    // Focus input
-    await page.click(selector);
-    await humanDelay(300, 600);
+// ============================================
+// LOGIN & 2FA DETECTION
+// ============================================
 
-    // Type character by character with variable delays + jitter
-    for (const char of vin) {
-        await page.keyboard.type(char);
-        // More variable typing speed: 60-220ms range with jitter
-        const baseTypingDelay = Math.floor(Math.random() * 160) + 60;
-        const typingDelay = baseTypingDelay + (jitter() / 2); // Smaller jitter for typing
-        await new Promise(resolve => setTimeout(resolve, Math.max(50, typingDelay)));
+async function detectLoginPage(page) {
+    console.log('  → Checking if login page is displayed...');
+
+    const isLoginPage = await page.evaluate(() => {
+        const usernameField = document.querySelector('input#username');
+        const passwordField = document.querySelector('input#password');
+        return !!(usernameField && passwordField);
+    });
+
+    if (isLoginPage) {
+        console.log('  ⚠️ Login page detected - credentials required!');
+    } else {
+        console.log('  ✅ Not a login page - session is valid');
     }
 
+    return isLoginPage;
+}
+
+async function detect2FAPage(page) {
+    console.log('  → Checking if 2FA page is displayed...');
+
+    const is2FAPage = await page.evaluate(() => {
+        const pageText = document.body.textContent.toLowerCase();
+
+        // Check for common 2FA text patterns
+        const has2FAText = pageText.includes('verification code') ||
+                          pageText.includes('authentication code') ||
+                          pageText.includes('enter code') ||
+                          pageText.includes('two-factor') ||
+                          pageText.includes('2fa') ||
+                          pageText.includes('otp') ||
+                          pageText.includes('security code');
+
+        // Check for input fields that look like 2FA code inputs
+        const inputs = Array.from(document.querySelectorAll('input'));
+        const has2FAInput = inputs.some(input => {
+            const id = (input.id || '').toLowerCase();
+            const name = (input.name || '').toLowerCase();
+            const placeholder = (input.placeholder || '').toLowerCase();
+            const type = input.type;
+            const maxLength = input.maxLength;
+
+            // Common 2FA input patterns
+            const nameMatch = id.includes('code') || id.includes('otp') || id.includes('token') ||
+                            name.includes('code') || name.includes('otp') || name.includes('token') ||
+                            placeholder.includes('code') || placeholder.includes('verification');
+
+            // 2FA inputs usually have maxLength of 6-8
+            const lengthMatch = maxLength >= 4 && maxLength <= 8;
+
+            // Usually text or number type
+            const typeMatch = type === 'text' || type === 'number' || type === 'tel';
+
+            return (nameMatch || lengthMatch) && typeMatch;
+        });
+
+        return has2FAText || has2FAInput;
+    });
+
+    if (is2FAPage) {
+        console.log('  ⚠️ 2FA page detected - code required!');
+    } else {
+        console.log('  ✅ Not a 2FA page');
+    }
+
+    return is2FAPage;
+}
+
+async function find2FAInput(page) {
+    console.log('  → Finding 2FA code input field...');
+
+    const inputSelector = await page.evaluate(() => {
+        // Try known MMR selectors first
+        const knownSelectors = ['#passcode', 'input[name="otp"]'];
+        for (const selector of knownSelectors) {
+            const input = document.querySelector(selector);
+            if (input) {
+                return selector;
+            }
+        }
+
+        // Fallback: Generic detection
+        const inputs = Array.from(document.querySelectorAll('input'));
+
+        // Try to find the most likely 2FA input
+        for (const input of inputs) {
+            const id = (input.id || '').toLowerCase();
+            const name = (input.name || '').toLowerCase();
+            const placeholder = (input.placeholder || '').toLowerCase();
+            const type = input.type;
+            const maxLength = input.maxLength;
+
+            // Strong indicators
+            const strongMatch = id.includes('code') || id.includes('otp') || id.includes('passcode') ||
+                              name.includes('code') || name.includes('otp') ||
+                              placeholder.includes('code');
+
+            // Length indicator (6-8 chars is typical for 2FA)
+            const lengthMatch = maxLength >= 4 && maxLength <= 8;
+
+            // Type indicator
+            const typeMatch = type === 'text' || type === 'number' || type === 'tel';
+
+            if (strongMatch && typeMatch) {
+                return input.id ? `#${input.id}` : `input[name="${input.name}"]`;
+            }
+
+            if (lengthMatch && typeMatch && input.type !== 'password') {
+                return input.id ? `#${input.id}` : `input[type="${type}"][maxlength="${maxLength}"]`;
+            }
+        }
+
+        return null;
+    });
+
+    if (inputSelector) {
+        console.log(`  ✅ Found 2FA input: ${inputSelector}`);
+    } else {
+        console.log('  ❌ Could not find 2FA input field');
+    }
+
+    return inputSelector;
+}
+
+// ============================================
+// LOGIN FLOW HANDLER
+// ============================================
+
+async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
+    console.log('\n🔐 LOGIN FLOW: Entering credentials...');
+    console.log(`  → Username: ${credentials.username}`);
+
+    // Fill username
+    console.log('  → Filling username field...');
+    await page.fill('input#username', credentials.username);
     await humanDelay(500, 1000);
+
+    // Fill password
+    console.log('  → Filling password field...');
+    await page.fill('input#password', credentials.password);
+    await humanDelay(500, 1000);
+
+    // Check "Remember my username" if available
+    try {
+        console.log('  → Checking "Remember my username"...');
+
+        // Try clicking the label (works for custom-styled checkboxes)
+        const labelSelectors = [
+            'label.remember-username',
+            'label:has-text("Remember my username")',
+            '.ping-checkbox-container:has-text("Remember my username")'
+        ];
+
+        let clicked = false;
+        for (const selector of labelSelectors) {
+            try {
+                const label = page.locator(selector).first();
+                const count = await label.count();
+                if (count > 0) {
+                    await label.click({ timeout: 3000 });
+                    console.log(`  ✅ Remember username checked (clicked ${selector})`);
+                    clicked = true;
+                    break;
+                }
+            } catch (e) {
+                // Try next selector
+            }
+        }
+
+        // Fallback: try checking the input directly with force
+        if (!clicked) {
+            const checkbox = page.locator('input#rememberUsername, input[name="pf.rememberUsername"]').first();
+            await checkbox.check({ timeout: 3000, force: true });
+            console.log('  ✅ Remember username checked (forced)');
+        }
+
+        await humanDelay(500, 1000);
+    } catch (e) {
+        console.log('  → Remember username checkbox not found or not clickable (skipping)');
+        console.log(`  → Error: ${e.message}`);
+    }
+
+    // Find and click submit button (MMR uses <a> tag with id="signOnButton")
+    console.log('  → Looking for Sign In button...');
+    const submitSelectors = [
+        'a#signOnButton',  // MMR specific
+        'button#signOnButton',
+        'a.ping-button:has-text("Sign In")',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Sign In")',
+        'button:has-text("Log In")',
+        'a:has-text("Sign In")'
+    ];
+
+    let submitButton = null;
+    for (const selector of submitSelectors) {
+        try {
+            const button = page.locator(selector).first();
+            const count = await button.count();
+            if (count > 0) {
+                submitButton = button;
+                console.log(`  ✅ Found Sign In button: ${selector}`);
+                break;
+            }
+        } catch (e) {
+            // Try next selector
+        }
+    }
+
+    if (!submitButton) {
+        throw new Error('Could not find Sign In button');
+    }
+
+    console.log('  → Clicking Sign In button...');
+    await submitButton.click();
+    console.log('  ✅ Login form submitted');
+
+    // Wait for navigation after login
+    console.log('  → Waiting for page to load after login...');
+    await humanDelay(4000, 6000);
+
+    // Check if 2FA page appeared
+    const is2FAPage = await detect2FAPage(page);
+    if (is2FAPage) {
+        console.log('\n🔐 2FA FLOW: Getting verification code...');
+
+        // Find 2FA input field
+        const twoFAInput = await find2FAInput(page);
+        if (!twoFAInput) {
+            console.error('❌ Could not find 2FA input field!');
+            const screenshot = await page.screenshot({ fullPage: false });
+            await Actor.setValue('2fa-input-not-found-screenshot', screenshot, { contentType: 'image/png' });
+            throw new Error('2FA page detected but input field not found');
+        }
+
+        // Call 2FA webhook and wait for code (5 minute timeout)
+        console.log(`  → Calling 2FA webhook: ${twoFactorWebhookUrl}`);
+        console.log('  → Waiting up to 5 minutes for your response...');
+
+        let twoFACode = null;
+        try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
+
+            const twoFAResponse = await fetch(twoFactorWebhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: credentials.username }),
+                signal: controller.signal
+            }).finally(() => clearTimeout(timeoutId));
+
+            if (!twoFAResponse.ok) {
+                const errorText = await twoFAResponse.text().catch(() => 'No error details');
+                throw new Error(`2FA webhook failed with status ${twoFAResponse.status}: ${errorText}`);
+            }
+
+            const responseText = await twoFAResponse.text();
+            console.log(`  → Webhook response received: ${responseText.substring(0, 100)}...`);
+
+            // Parse 2FA code (try JSON first, fallback to plain text)
+            try {
+                const jsonResponse = JSON.parse(responseText);
+
+                // If JSON is a primitive (number or string), use it directly
+                if (typeof jsonResponse === 'number' || typeof jsonResponse === 'string') {
+                    twoFACode = String(jsonResponse).trim();
+                    console.log('  → Parsed as JSON primitive:', twoFACode);
+                } else if (typeof jsonResponse === 'object') {
+                    // If JSON is an object, look for code in known fields
+                    twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
+                    console.log('  → Parsed as JSON object');
+                }
+            } catch (e) {
+                // Not JSON, treat as plain text
+                twoFACode = responseText.trim();
+                console.log('  → Parsed as plain text');
+            }
+
+            if (!twoFACode) {
+                throw new Error('2FA webhook response did not contain a code');
+            }
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                throw new Error('2FA webhook timed out after 5 minutes - no response received');
+            }
+            throw error;
+        }
+
+        console.log(`  ✅ 2FA code received: ${twoFACode}`);
+
+        // Enter 2FA code
+        console.log('  → Entering 2FA code...');
+        await page.fill(twoFAInput, twoFACode);
+        console.log('  ✅ Code entered');
+
+        // Wait for button to become enabled (checkInput() function needs to run)
+        console.log('  → Waiting for Sign In button to become enabled...');
+        await humanDelay(1000, 2000);
+
+        // Find submit button (try multiple selectors)
+        console.log('  → Looking for submit button...');
+        const buttonSelectors = [
+            'button#sign-on',  // Specific to MMR
+            'button:has-text("Sign In")',
+            'button[type="submit"]',
+            'input[type="submit"]',
+            'button:has-text("Submit")',
+            'button:has-text("Verify")',
+            'button:has-text("Continue")'
+        ];
+
+        let twoFASubmit = null;
+        for (const selector of buttonSelectors) {
+            try {
+                const button = page.locator(selector).first();
+                const count = await button.count();
+                if (count > 0) {
+                    twoFASubmit = button;
+                    console.log(`  ✅ Found button: ${selector}`);
+                    break;
+                }
+            } catch (e) {
+                // Try next selector
+            }
+        }
+
+        if (!twoFASubmit) {
+            throw new Error('Could not find 2FA submit button');
+        }
+
+        // Wait for button to be enabled (disabled attribute removed)
+        console.log('  → Waiting for button to be clickable...');
+        await twoFASubmit.waitFor({ state: 'visible', timeout: 10000 });
+
+        // Additional wait to ensure button is enabled
+        await humanDelay(500, 1000);
+
+        // Click submit button
+        console.log('  → Clicking Sign In button...');
+        await twoFASubmit.click({ force: false, timeout: 10000 });
+        console.log('  ✅ 2FA code submitted');
+
+        // Wait for 2FA verification
+        console.log('  → Waiting for 2FA verification...');
+        await humanDelay(4000, 6000);
+    }
+
+    console.log('✅ Login flow completed - session established!');
 }
 
 // ============================================
@@ -75,17 +413,32 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     const blockingStatus = await page.evaluate(() => {
         const text = document.body.textContent.toLowerCase();
         const html = document.documentElement.innerHTML.toLowerCase();
+        const visibleText = document.body.innerText.toLowerCase();
+
+        // More specific CAPTCHA detection - look for actual CAPTCHA elements
+        const hasRecaptchaElement = !!document.querySelector('.g-recaptcha') ||
+                                   !!document.querySelector('[data-sitekey]') ||
+                                   !!document.querySelector('iframe[src*="recaptcha"]');
+
+        const hasHcaptchaElement = !!document.querySelector('.h-captcha') ||
+                                  !!document.querySelector('iframe[src*="hcaptcha"]');
+
+        const hasCaptchaIframe = !!document.querySelector('iframe[src*="captcha"]');
+
+        // Only flag as CAPTCHA if we see actual CAPTCHA UI elements or very specific text
+        const hasCaptchaChallenge = (visibleText.includes('complete the captcha') ||
+                                    visibleText.includes('solve the captcha') ||
+                                    visibleText.includes('verify you are human') ||
+                                    visibleText.includes('verify you\'re human') ||
+                                    visibleText.includes('i am not a robot')) &&
+                                   (hasRecaptchaElement || hasHcaptchaElement || hasCaptchaIframe);
 
         return {
-            hasCaptcha: text.includes('captcha') ||
-                       text.includes('verify you are human') ||
-                       text.includes('verify you\'re human'),
-            hasRecaptcha: !!document.querySelector('.g-recaptcha') ||
-                         !!document.querySelector('[data-sitekey]') ||
-                         html.includes('recaptcha'),
-            hasCloudflare: text.includes('cloudflare') ||
-                          text.includes('checking your browser') ||
-                          text.includes('challenge'),
+            hasCaptcha: hasCaptchaChallenge,
+            hasRecaptcha: hasRecaptchaElement,
+            hasHcaptcha: hasHcaptchaElement,
+            hasCloudflare: (text.includes('cloudflare') && text.includes('checking your browser')) ||
+                          (text.includes('challenge') && text.includes('ray id')),
             hasAccessDenied: text.includes('access denied') ||
                            text.includes('403 forbidden') ||
                            text.includes('not authorized'),
@@ -103,6 +456,9 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     }
     if (blockingStatus.hasRecaptcha) {
         console.log('  ⚠️ reCAPTCHA widget found!');
+    }
+    if (blockingStatus.hasHcaptcha) {
+        console.log('  ⚠️ hCaptcha widget found!');
     }
     if (blockingStatus.hasCloudflare) {
         console.log('  ⚠️ Cloudflare challenge detected!');
@@ -127,79 +483,7 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
 }
 
 // ============================================
-// MMR EXTRACTION FUNCTIONS
-// ============================================
-
-async function extractMMRValues(page) {
-    console.log('  → Extracting MMR values from page...');
-
-    const mmrData = await page.evaluate(() => {
-        // Helper function to extract number from price string
-        const extractPrice = (text) => {
-            if (!text) return null;
-            const match = text.match(/\$[\d,]+/);
-            if (!match) return null;
-            return parseInt(match[0].replace(/[$,]/g, ''));
-        };
-
-        // Extract Base MMR (36px font, inside baseMMRTitle container)
-        const baseMmrEl = document.querySelector('.styles__baseMMRTitle__AfQgP .styles__currency__EkR32');
-        const baseMmrText = baseMmrEl?.textContent?.trim();
-
-        // Extract Adjusted MMR (44px font, inside adjustedMMRContainer)
-        const adjustedMmrEl = document.querySelector('.styles__adjustedMMRContainer__lixDF .styles__currency__EkR32');
-        const adjustedMmrText = adjustedMmrEl?.textContent?.trim();
-
-        // Extract MMR Range ($36,700 - $40,300)
-        const mmrRangeEl = document.querySelector('.styles__adjMMRRangeValue__fOTt5');
-        const mmrRangeText = mmrRangeEl?.textContent?.trim();
-
-        // Extract Estimated Retail Value
-        const retailEl = document.querySelector('.styles__estimatedRetailValue__Wkxa3');
-        const retailText = retailEl?.textContent?.trim();
-
-        // Extract Typical Range (for retail)
-        const typicalRangeEl = document.querySelector('.styles__adjTypicalRangeValue__rwVzw');
-        const typicalRangeText = typicalRangeEl?.textContent?.trim();
-
-        // Parse MMR Range into min and max
-        let mmrRangeMin = null;
-        let mmrRangeMax = null;
-        if (mmrRangeText) {
-            const prices = mmrRangeText.match(/\$[\d,]+/g);
-            if (prices && prices.length >= 2) {
-                mmrRangeMin = parseInt(prices[0].replace(/[$,]/g, ''));
-                mmrRangeMax = parseInt(prices[1].replace(/[$,]/g, ''));
-            }
-        }
-
-        return {
-            mmr_base_usd: extractPrice(baseMmrText),
-            mmr_adjusted_usd: extractPrice(adjustedMmrText),
-            mmr_range_min_usd: mmrRangeMin,
-            mmr_range_max_usd: mmrRangeMax,
-            estimated_retail_usd: extractPrice(retailText),
-            raw_data: {
-                base_mmr_text: baseMmrText,
-                adjusted_mmr_text: adjustedMmrText,
-                mmr_range_text: mmrRangeText,
-                retail_text: retailText,
-                typical_range_text: typicalRangeText
-            }
-        };
-    });
-
-    console.log('  ✅ MMR values extracted:');
-    console.log(`     • Base MMR: ${mmrData.mmr_base_usd ? '$' + mmrData.mmr_base_usd.toLocaleString() : 'NOT FOUND'}`);
-    console.log(`     • Adjusted MMR: ${mmrData.mmr_adjusted_usd ? '$' + mmrData.mmr_adjusted_usd.toLocaleString() : 'NOT FOUND'}`);
-    console.log(`     • MMR Range: ${mmrData.mmr_range_min_usd ? '$' + mmrData.mmr_range_min_usd.toLocaleString() : '?'} - ${mmrData.mmr_range_max_usd ? '$' + mmrData.mmr_range_max_usd.toLocaleString() : '?'}`);
-    console.log(`     • Estimated Retail: ${mmrData.estimated_retail_usd ? '$' + mmrData.estimated_retail_usd.toLocaleString() : 'NOT FOUND'}`);
-
-    return mmrData;
-}
-
-// ============================================
-// MAIN SCRAPER
+// MAIN COOKIE REFRESHER
 // ============================================
 
 await Actor.main(async () => {
@@ -207,28 +491,46 @@ await Actor.main(async () => {
 
     const {
         manheimCookies = [],
-        supabaseEdgeFunctionUrl = 'https://nyhpgaksdlmrclraqqmg.supabase.co/functions/v1/get-next-vin',
-        n8nWebhookUrl = '',
-        maxVINsPerRun = 100,
-        delayBetweenVINs = [3000, 8000], // [min, max] in milliseconds
+        credentials = null,
+        twoFactorWebhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/mmr2facode',
+        cookieWebhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/mmrcookies',
         proxyConfiguration = {
-            useApifyProxy: true,
-            apifyProxyGroups: ['RESIDENTIAL'],
-            apifyProxyCountry: 'CA'
+            useApifyProxy: false
         }
     } = input;
 
-    console.log('🚀 Starting Manheim MMR Scraper...');
-    console.log(`📊 Max VINs per run: ${maxVINsPerRun}`);
-    console.log(`⏱️ Delay between VINs: ${delayBetweenVINs[0]/1000}s - ${delayBetweenVINs[1]/1000}s`);
+    console.log('🍪 Starting Manheim Cookie Refresher (with Persistent Browser)...');
+    console.log(`📤 Cookie Webhook URL: ${cookieWebhookUrl}`);
+    console.log(`🔐 2FA Webhook URL: ${twoFactorWebhookUrl}`);
+    console.log(`👤 Credentials provided: ${credentials ? 'Yes' : 'No'}`);
 
     // Validate inputs
-    if (!manheimCookies || manheimCookies.length === 0) {
-        throw new Error('❌ manheimCookies is required! Please provide your Manheim session cookies.');
+    if (!cookieWebhookUrl) {
+        throw new Error('❌ cookieWebhookUrl is required! Please provide your webhook URL for cookie delivery.');
     }
 
-    if (!n8nWebhookUrl) {
-        throw new Error('❌ n8nWebhookUrl is required! Please provide your n8n webhook URL.');
+    // Cookies are optional now (can login with credentials)
+    if ((!manheimCookies || manheimCookies.length === 0) && !credentials) {
+        throw new Error('❌ Either manheimCookies OR credentials is required!');
+    }
+
+    if (manheimCookies && manheimCookies.length > 0) {
+        console.log(`\n🍪 Input cookies: ${manheimCookies.length} cookies loaded`);
+
+        // Log cookie details
+        const cookiesByDomain = {};
+        manheimCookies.forEach(cookie => {
+            if (!cookiesByDomain[cookie.domain]) {
+                cookiesByDomain[cookie.domain] = [];
+            }
+            cookiesByDomain[cookie.domain].push(cookie.name);
+        });
+
+        Object.entries(cookiesByDomain).forEach(([domain, names]) => {
+            console.log(`  → ${domain}: ${names.join(', ')}`);
+        });
+    } else {
+        console.log('\n⚠️ No cookies provided - will use credential login');
     }
 
     // Setup proxy configuration
@@ -237,29 +539,28 @@ await Actor.main(async () => {
         const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
         proxyUrl = await proxyConfig.newUrl();
 
-        console.log('🌍 Proxy Configuration:');
+        console.log('\n🌍 Proxy Configuration:');
         console.log(`  ✅ Country: ${proxyConfiguration.apifyProxyCountry}`);
         console.log(`  ✅ Groups: ${proxyConfiguration.apifyProxyGroups.join(', ')}`);
         console.log(`  ✅ Proxy URL: ${proxyUrl.substring(0, 50)}...`);
     } else {
-        console.log('🌍 No proxy - using direct connection');
+        console.log('\n🌍 No proxy - using direct connection');
     }
 
-    // Launch browser with stealth
-    const browser = await chromium.launch({
-        headless: true,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-web-security',
-        ],
-    });
+    // Launch PERSISTENT browser context (preserves cookies/storage between runs)
+    console.log('\n🌐 Launching persistent browser context...');
+    console.log('  → Profile: ./manheim_browser_profile');
 
     const contextOptions = {
         viewport: { width: 1920, height: 1080 },
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         locale: 'en-CA', // Canadian locale
         timezoneId: 'America/Edmonton', // Alberta, Canada timezone (Mountain Time)
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-web-security',
+        ],
     };
 
     // Only add proxy if configured
@@ -267,49 +568,51 @@ await Actor.main(async () => {
         contextOptions.proxy = { server: proxyUrl };
     }
 
-    const context = await browser.newContext(contextOptions);
+    const context = await chromium.launchPersistentContext('./manheim_browser_profile', contextOptions);
 
     // Set default navigation timeout
     context.setDefaultNavigationTimeout(90000);
 
-    // Inject cookies BEFORE navigating
-    console.log('\n🍪 Injecting session cookies...');
-    console.log(`  → Injecting ${manheimCookies.length} cookies`);
+    console.log('  ✅ Persistent browser context ready');
 
-    // Group cookies by domain for debugging
-    const cookiesByDomain = {};
-    manheimCookies.forEach(cookie => {
-        if (!cookiesByDomain[cookie.domain]) {
-            cookiesByDomain[cookie.domain] = [];
-        }
-        cookiesByDomain[cookie.domain].push(cookie.name);
-    });
+    // Check if profile already has cookies
+    const existingCookies = await context.cookies();
+    const hasExistingCookies = existingCookies.some(c =>
+        c.name === '_cl' || c.name === 'SESSION'
+    );
 
-    Object.entries(cookiesByDomain).forEach(([domain, names]) => {
-        console.log(`  → ${domain}: ${names.join(', ')}`);
-    });
+    if (hasExistingCookies) {
+        console.log(`\n🍪 Found ${existingCookies.length} existing cookies in browser profile`);
+    }
 
-    await context.addCookies(manheimCookies);
-    console.log('  ✅ Cookies injected successfully');
+    // Inject fresh cookies if provided (overwrites existing)
+    if (manheimCookies && manheimCookies.length > 0) {
+        console.log('\n🍪 Injecting fresh cookies from input...');
+        await context.addCookies(manheimCookies);
+        console.log(`  ✅ Injected ${manheimCookies.length} cookies (merged with profile)`);
+    } else if (!hasExistingCookies && !credentials) {
+        throw new Error('❌ No cookies in profile and no credentials provided - cannot proceed');
+    } else if (!hasExistingCookies) {
+        console.log('\n⚠️ No cookies in profile - will use credential login');
+    } else {
+        console.log('\n✅ Using existing cookies from browser profile');
+    }
 
-    const page = await context.newPage();
+    const page = context.pages()[0] || await context.newPage();
 
     try {
-        // STEP 1: Verify login by visiting Manheim main site
-        console.log('\n🌐 STEP 1: Verifying Manheim session...');
-        console.log('  → Navigating to: https://www.manheim.com/');
+        // STEP 1: Visit Manheim site homepage to trigger session refresh
+        console.log('\n🌐 STEP 1: Visiting Manheim site homepage...');
+        console.log('  → Navigating to: https://site.manheim.com/');
 
-        await page.goto('https://www.manheim.com/', {
+        await page.goto('https://site.manheim.com/', {
             waitUntil: 'domcontentloaded',
             timeout: 90000
         });
         console.log('  ✅ Page loaded (domcontentloaded)');
 
-        console.log('  → Waiting 3-5 seconds...');
-        await humanDelay(3000, 5000);
-
-        console.log('  → Simulating mouse movement...');
-        await simulateHumanMouse(page);
+        console.log('  → Waiting 4-6 seconds for page to fully load...');
+        await humanDelay(4000, 6000);
 
         // Check for CAPTCHA or blocking
         const homeBlocking = await detectCaptchaOrBlocking(page, 'Manheim home');
@@ -319,15 +622,187 @@ await Actor.main(async () => {
             await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
             throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
         }
-        if (homeBlocking.hasSessionExpired) {
-            console.error('\n❌ Session expired detected!');
-            throw new Error('Session cookies expired - please extract fresh cookies');
+
+        // Check if login page appeared (cookies invalid)
+        const isLoginPage = await detectLoginPage(page);
+        if (isLoginPage) {
+            if (!credentials || !credentials.username || !credentials.password) {
+                console.error('\n❌ Login page detected but no credentials provided!');
+                const screenshot = await page.screenshot({ fullPage: false });
+                await Actor.setValue('login-required-screenshot', screenshot, { contentType: 'image/png' });
+                throw new Error('Session expired and credentials not provided - cannot proceed');
+            }
+
+            // CREDENTIAL LOGIN FLOW
+            console.log('\n🔐 LOGIN FLOW: Entering credentials...');
+            console.log(`  → Username: ${credentials.username}`);
+
+            // Fill username
+            console.log('  → Filling username field...');
+            await page.fill('input#username', credentials.username);
+            await humanDelay(500, 1000);
+
+            // Fill password
+            console.log('  → Filling password field...');
+            await page.fill('input#password', credentials.password);
+            await humanDelay(500, 1000);
+
+            // Check "Remember my username"
+            console.log('  → Checking "Remember my username"...');
+            await page.check('input#rememberUsername');
+            await humanDelay(500, 1000);
+
+            // Find and click submit button
+            console.log('  → Clicking submit button...');
+            const submitButton = await page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")').first();
+            await submitButton.click();
+            console.log('  ✅ Login form submitted');
+
+            // Wait for navigation after login
+            console.log('  → Waiting for page to load after login...');
+            await humanDelay(4000, 6000);
+
+            // Check if 2FA page appeared
+            const is2FAPage = await detect2FAPage(page);
+            if (is2FAPage) {
+                console.log('\n🔐 2FA FLOW: Getting verification code...');
+
+                // Find 2FA input field
+                const twoFAInput = await find2FAInput(page);
+                if (!twoFAInput) {
+                    console.error('❌ Could not find 2FA input field!');
+                    const screenshot = await page.screenshot({ fullPage: false });
+                    await Actor.setValue('2fa-input-not-found-screenshot', screenshot, { contentType: 'image/png' });
+                    throw new Error('2FA page detected but input field not found');
+                }
+
+                // Call 2FA webhook and wait for code (2.5 minute timeout)
+                console.log(`  → Calling 2FA webhook: ${twoFactorWebhookUrl}`);
+                console.log('  → Waiting up to 2.5 minutes for your response...');
+
+                let twoFACode = null;
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 150000); // 2.5 minutes
+
+                    const twoFAResponse = await fetch(twoFactorWebhookUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ username: credentials.username }),
+                        signal: controller.signal
+                    }).finally(() => clearTimeout(timeoutId));
+
+                    if (!twoFAResponse.ok) {
+                        const errorText = await twoFAResponse.text().catch(() => 'No error details');
+                        throw new Error(`2FA webhook failed with status ${twoFAResponse.status}: ${errorText}`);
+                    }
+
+                    const responseText = await twoFAResponse.text();
+                    console.log(`  → Webhook response received: ${responseText.substring(0, 100)}...`);
+
+                    // Parse 2FA code (try JSON first, fallback to plain text)
+                    try {
+                        const jsonResponse = JSON.parse(responseText);
+                        twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
+                        console.log('  → Parsed as JSON');
+                    } catch (e) {
+                        // Not JSON, treat as plain text
+                        twoFACode = responseText.trim();
+                        console.log('  → Parsed as plain text');
+                    }
+
+                    if (!twoFACode) {
+                        throw new Error('2FA webhook response did not contain a code');
+                    }
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        throw new Error('2FA webhook timed out after 2.5 minutes - no response received');
+                    }
+                    throw error;
+                }
+
+                console.log(`  ✅ 2FA code received: ${twoFACode}`);
+
+                // Enter 2FA code
+                console.log('  → Entering 2FA code...');
+                await page.fill(twoFAInput, twoFACode);
+                console.log('  ✅ Code entered');
+
+                // Wait for button to become enabled (checkInput() function needs to run)
+                console.log('  → Waiting for Sign In button to become enabled...');
+                await humanDelay(1000, 2000);
+
+                // Find submit button (try multiple selectors)
+                console.log('  → Looking for submit button...');
+                const buttonSelectors = [
+                    'button#sign-on',  // Specific to MMR
+                    'button:has-text("Sign In")',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("Submit")',
+                    'button:has-text("Verify")',
+                    'button:has-text("Continue")'
+                ];
+
+                let twoFASubmit = null;
+                for (const selector of buttonSelectors) {
+                    try {
+                        const button = page.locator(selector).first();
+                        const count = await button.count();
+                        if (count > 0) {
+                            twoFASubmit = button;
+                            console.log(`  ✅ Found button: ${selector}`);
+                            break;
+                        }
+                    } catch (e) {
+                        // Try next selector
+                    }
+                }
+
+                if (!twoFASubmit) {
+                    throw new Error('Could not find 2FA submit button');
+                }
+
+                // Wait for button to be enabled (disabled attribute removed)
+                console.log('  → Waiting for button to be clickable...');
+                await twoFASubmit.waitFor({ state: 'visible', timeout: 10000 });
+
+                // Additional wait to ensure button is enabled
+                await humanDelay(500, 1000);
+
+                // Click submit button
+                console.log('  → Clicking Sign In button...');
+                await twoFASubmit.click({ force: false, timeout: 10000 });
+                console.log('  ✅ 2FA code submitted');
+
+                // Wait for 2FA verification
+                console.log('  → Waiting for 2FA verification...');
+                await humanDelay(4000, 6000);
+            }
+
+            console.log('✅ Login flow completed - session established!');
         }
 
         console.log('✅ Manheim homepage loaded successfully');
 
-        // STEP 2: Access MMR tool (optimized with smart fallback)
-        console.log('\n📊 STEP 2: Accessing MMR tool...');
+        // STEP 2: Simulate human activity
+        console.log('\n🖱️ STEP 2: Simulating human activity...');
+        console.log('  → Mouse movement...');
+        await simulateHumanMouse(page);
+        await humanDelay(1000, 2000);
+
+        console.log('  → Scrolling...');
+        await simulateHumanScroll(page);
+        await humanDelay(1000, 2000);
+
+        console.log('  → More mouse movement...');
+        await simulateHumanMouse(page);
+        await humanDelay(1000, 2000);
+
+        console.log('✅ Human activity simulated');
+
+        // STEP 3: Access MMR tool to ensure full cookie refresh
+        console.log('\n📊 STEP 3: Accessing MMR tool to refresh cookies...');
         console.log('  → Simulating mouse movement...');
         await simulateHumanMouse(page);
         await humanDelay(1000, 2000);
@@ -425,506 +900,317 @@ await Actor.main(async () => {
         // Wait for page to fully load
         console.log('  → Waiting for page to load...');
         await mmrPage.waitForLoadState('domcontentloaded');
-        await humanDelay(2000, 4000);
+        await humanDelay(3000, 5000);
 
         console.log('✅ MMR tool loaded successfully');
 
-        // Check for CAPTCHA on MMR page
+        // Check if we landed on a login page instead of MMR tool
+        console.log('  → Checking if login is required...');
+        const isMMRLoginPage = await detectLoginPage(mmrPage);
+
+        if (isMMRLoginPage) {
+            console.log('  ⚠️ Login page detected in MMR popup - need to authenticate');
+
+            // Check if we have credentials
+            if (!credentials || !credentials.username || !credentials.password) {
+                throw new Error('Login required but no credentials provided');
+            }
+
+            // Perform login flow
+            await handleLoginFlow(mmrPage, credentials, twoFactorWebhookUrl);
+
+            // After login, wait for redirect to MMR tool
+            console.log('  → Waiting for redirect to MMR tool after login...');
+            await humanDelay(3000, 5000);
+
+            // Check if we're now on MMR tool
+            const currentUrl = mmrPage.url();
+            console.log(`  → Current URL after login: ${currentUrl}`);
+
+            if (currentUrl.includes('auth.manheim.com')) {
+                throw new Error('Still on auth page after login - authentication may have failed');
+            }
+        } else {
+            console.log('  ✅ Already authenticated - MMR tool is accessible');
+        }
+
+        // Now check for CAPTCHA (after login check)
+        console.log('  → Checking for CAPTCHA on MMR page...');
         const mmrBlocking = await detectCaptchaOrBlocking(mmrPage, 'MMR tool');
-        if (mmrBlocking.hasCaptcha || mmrBlocking.hasRecaptcha || mmrBlocking.hasCloudflare) {
+        if (mmrBlocking.hasCaptcha || mmrBlocking.hasRecaptcha || mmrBlocking.hasHcaptcha || mmrBlocking.hasCloudflare) {
             console.error('\n❌ CAPTCHA or challenge detected on MMR page!');
             const screenshot = await mmrPage.screenshot({ fullPage: false });
             await Actor.setValue('mmr-captcha-screenshot', screenshot, { contentType: 'image/png' });
             throw new Error('CAPTCHA on MMR tool - cannot proceed automatically');
         }
+        console.log('  ✅ No CAPTCHA detected');
 
-        // STEP 3: Process VINs from Supabase
-        let vinsProcessed = 0;
-        let vinsSuccessful = 0;
-        let vinsFailed = 0;
+        // STEP 4: More human activity on MMR page
+        console.log('\n🖱️ STEP 4: Simulating human activity on MMR page...');
+        console.log('  → Mouse movement...');
+        await simulateHumanMouse(mmrPage);
+        await humanDelay(1500, 2500);
 
-        console.log(`\n${'='.repeat(60)}`);
-        console.log(`🔄 Starting VIN processing loop (max: ${maxVINsPerRun})`);
-        console.log(`${'='.repeat(60)}\n`);
+        console.log('  → Scrolling...');
+        await simulateHumanScroll(mmrPage);
+        await humanDelay(1500, 2500);
 
-        while (vinsProcessed < maxVINsPerRun) {
-            try {
-                // Get next VIN from Supabase
-                console.log(`\n📞 STEP 3.${vinsProcessed + 1}: Fetching VIN from Supabase...`);
-                console.log(`  → URL: ${supabaseEdgeFunctionUrl}`);
-                const vinResponse = await fetch(supabaseEdgeFunctionUrl);
-                const vinData = await vinResponse.json();
+        console.log('  → Final mouse movement...');
+        await simulateHumanMouse(mmrPage);
+        await humanDelay(1000, 2000);
 
-                if (!vinData.success || !vinData.data) {
-                    console.log('  ✅ No more pending VINs. Scraping complete!');
+        console.log('✅ Human activity completed on MMR page');
+
+        // STEP 4.5: Click VIN input to trigger JS events
+        console.log('\n🔘 STEP 4.5: Clicking VIN input field...');
+        try {
+            await mmrPage.click('#vinText', { timeout: 5000 });
+            console.log('  ✅ VIN input field clicked');
+            await humanDelay(1000, 2000);
+        } catch (error) {
+            console.log(`  ⚠️ Could not click VIN input: ${error.message}`);
+            console.log('  → Continuing without button click...');
+        }
+
+        // STEP 5: Navigate back using browser back button (like manual process)
+        console.log('\n🔙 STEP 5: Using browser back button to return...');
+        console.log('  → This mimics the manual cookie extraction process');
+
+        // Use browser back button (like manual process)
+        await page.goBack({ waitUntil: 'domcontentloaded' });
+        console.log('  ✅ Returned to previous page using back button');
+
+        console.log('  → Waiting 3-5 seconds for cookies to settle...');
+        await humanDelay(3000, 5000);
+
+        // STEP 5.5: Check if cookies changed, if not perform max 3 hard refreshes
+        console.log('\n🔄 STEP 5.5: Checking if cookies changed...');
+
+        // Helper function to check if cookies changed
+        const checkCookiesChanged = (currentCookies, inputCookies) => {
+            const inputCL = inputCookies.find(c => c.name === '_cl')?.value;
+            const inputSESSION = inputCookies.find(c => c.name === 'SESSION')?.value;
+            const inputSig = inputCookies.find(c => c.name === 'session.sig')?.value;
+
+            const currentCL = currentCookies.find(c => c.name === '_cl' && c.domain === '.manheim.com')?.value;
+            const currentSESSION = currentCookies.find(c => c.name === 'SESSION' && c.domain === '.manheim.com')?.value;
+            const currentSig = currentCookies.find(c => c.name === 'session.sig' && c.domain === 'mcom-header-footer.manheim.com')?.value;
+
+            return (
+                currentCL !== inputCL ||
+                currentSESSION !== inputSESSION ||
+                currentSig !== inputSig
+            );
+        };
+
+        let attempts = 0;
+        const maxAttempts = 3;
+        let cookiesChanged = false;
+
+        // Initial check
+        let currentCookies = await context.cookies();
+        cookiesChanged = checkCookiesChanged(currentCookies, manheimCookies);
+
+        if (cookiesChanged) {
+            console.log('  ✅ Cookies have changed! Fresh cookies detected.');
+        } else {
+            console.log('  ⚠️ Cookies unchanged, performing hard refreshes...');
+
+            while (attempts < maxAttempts && !cookiesChanged) {
+                attempts++;
+                console.log(`  → Attempt ${attempts}/${maxAttempts}: Performing hard refresh...`);
+
+                await page.reload({ waitUntil: 'domcontentloaded' });
+                await humanDelay(3000, 5000);
+
+                currentCookies = await context.cookies();
+                cookiesChanged = checkCookiesChanged(currentCookies, manheimCookies);
+
+                if (cookiesChanged) {
+                    console.log(`  ✅ Cookies changed after ${attempts} refresh(es)!`);
                     break;
                 }
-
-                const {
-                    id: listing_id,
-                    vin,
-                    trim,
-                    cargurus_price_cad,
-                    cargurus_mileage_km,
-                    mileage_miles
-                } = vinData.data;
-
-                console.log(`\n${'='.repeat(60)}`);
-                console.log(`🚗 Processing VIN #${vinsProcessed + 1}: ${vin}`);
-                console.log(`📍 Listing ID: ${listing_id}`);
-                console.log(`🎨 Trim: ${trim || 'Not specified'}`);
-                console.log(`💰 CarGurus Price: $${cargurus_price_cad} CAD`);
-                console.log(`🛣️ Mileage: ${cargurus_mileage_km} km (${mileage_miles} mi)`);
-                console.log(`${'='.repeat(60)}\n`);
-
-                // Check and close any leftover modal before processing VIN
-                const modalOpen = await mmrPage.evaluate(() => {
-                    const modal = document.querySelector('.styles__overlay__jMJmy.show--inline-block');
-                    if (modal) {
-                        const closeButton = modal.querySelector('.styles__close__uf9p4');
-                        if (closeButton) {
-                            closeButton.click();
-                            return true;
-                        }
-                    }
-                    return false;
-                });
-
-                if (modalOpen) {
-                    console.log('  🧹 Closed leftover modal from previous VIN');
-                    await humanDelay(1000, 2000);
-                }
-
-                // STEP 4: Input VIN and search
-                console.log('🔍 STEP 4: Searching VIN in MMR...');
-                console.log('  → Simulating mouse movement...');
-                await simulateHumanMouse(mmrPage);
-                await humanDelay(1000, 2000);
-
-                // Clear existing input if any
-                console.log('  → Clearing VIN input field...');
-                const vinInput = mmrPage.locator('#vinText');
-                await vinInput.clear();
-                await humanDelay(300, 600);
-
-                // Type VIN human-like
-                console.log(`  ⌨️ Typing VIN: ${vin}...`);
-                await humanTypeVIN(mmrPage, '#vinText', vin);
-                console.log('  ✅ VIN typed');
-
-                // Click search button
-                console.log('  → Clicking search button [aria-label="Search VIN"]...');
-                await simulateHumanMouse(mmrPage);
-                const searchButton = mmrPage.locator('button[aria-label="Search VIN"]');
-                await searchButton.click({ timeout: 30000 });
-                console.log('  ✅ Search button clicked');
-
-                // Wait for results to load
-                console.log('  ⏳ Waiting 4-7 seconds for results...');
-                await humanDelay(4000, 7000);
-
-                // Check if VIN was found (improved detection)
-                const pageStatus = await mmrPage.evaluate(() => {
-                    const errorText = document.body.textContent.toLowerCase();
-                    const hasErrorMessage = errorText.includes('no data found') ||
-                                          errorText.includes('vin not found') ||
-                                          errorText.includes('invalid vin') ||
-                                          errorText.includes('no results') ||
-                                          errorText.includes('not available');
-
-                    // Also check if odometer input exists (if not, likely VIN not found)
-                    const hasOdometerInput = !!document.querySelector('input#Odometer');
-
-                    return {
-                        vinNotFound: hasErrorMessage || !hasOdometerInput,
-                        hasOdometerInput: hasOdometerInput,
-                        errorMessage: hasErrorMessage
-                    };
-                });
-
-                if (pageStatus.vinNotFound) {
-                    const reason = pageStatus.errorMessage
-                        ? 'VIN not found in MMR database (error message detected)'
-                        : 'VIN not found in MMR database (odometer input missing)';
-
-                    console.log(`⚠️ ${reason}`);
-
-                    // Send to webhook with status
-                    await fetch(n8nWebhookUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            listing_id,
-                            vin,
-                            trim,
-                            cargurus_price_cad,
-                            cargurus_mileage_km,
-                            mileage_miles,
-                            mmr_status: 'vin_not_found',
-                            error: reason
-                        })
-                    });
-
-                    vinsFailed++;
-                    vinsProcessed++;
-                    continue;
-                }
-
-                // STEP 4.5: Handle multiple vehicle styles modal (if it appears)
-                console.log('\n🔍 Checking for vehicle style selection modal...');
-                const modalExists = await mmrPage.evaluate(() => {
-                    const modal = document.querySelector('.styles__overlay__jMJmy.show--inline-block');
-                    return !!modal;
-                });
-
-                if (modalExists) {
-                    console.log('  ✅ Modal detected! Multiple vehicle styles found.');
-
-                    // Try to match by trim FIRST, then fallback to mileage
-                    const selectionResult = await mmrPage.evaluate(({ vehicleTrim, targetMileage }) => {
-                        const rows = document.querySelectorAll('.styles__tableContainer__At0ta tbody tr');
-                        let bestIndex = 0;
-                        let matchStrategy = 'mileage'; // default fallback
-                        let smallestDiff = Infinity;
-                        let matchedStyle = '';
-
-                        // LOG: Show all available styles for debugging
-                        const availableStyles = [];
-                        rows.forEach((row, index) => {
-                            const styleCell = row.cells[3];
-                            if (styleCell) {
-                                availableStyles.push(`${index + 1}. ${styleCell.textContent.trim()}`);
-                            }
-                        });
-
-                        // Helper: Normalize text for smart matching
-                        const normalize = (text) => {
-                            return text
-                                .toUpperCase()
-                                .replace(/2-DOOR/gi, '2DR')
-                                .replace(/4-DOOR/gi, '4DR')
-                                .replace(/2 DOOR/gi, '2DR')
-                                .replace(/4 DOOR/gi, '4DR')
-                                .replace(/4WD/gi, '4X4')
-                                .replace(/AWD/gi, '4X4')
-                                .replace(/FWD/gi, '2WD')
-                                .replace(/[-_]/g, ' ') // Replace dashes/underscores with spaces
-                                .replace(/\s+/g, ' ')  // Collapse multiple spaces
-                                .trim();
-                        };
-
-                        // STRATEGY 1: Simple includes match (works most of the time)
-                        if (vehicleTrim && vehicleTrim.trim() !== '') {
-                            const trimUpper = vehicleTrim.trim().toUpperCase();
-
-                            for (let index = 0; index < rows.length; index++) {
-                                const row = rows[index];
-                                const styleCell = row.cells[3];
-                                if (!styleCell) continue;
-
-                                const styleText = styleCell.textContent.trim().toUpperCase();
-
-                                if (styleText.includes(trimUpper)) {
-                                    bestIndex = index;
-                                    matchStrategy = 'trim-exact';
-                                    matchedStyle = styleCell.textContent.trim();
-                                    break;
-                                }
-                            }
-                        }
-
-                        // STRATEGY 2: Smart keyword matching (for edge cases like "Sport 2-Door 4WD")
-                        if (matchStrategy === 'mileage' && vehicleTrim && vehicleTrim.trim() !== '') {
-                            const normalizedTrim = normalize(vehicleTrim);
-                            const trimKeywords = normalizedTrim.split(' ').filter(k => k.length > 1); // Min 2 chars
-
-                            let bestScore = 0;
-                            let bestSmartIndex = 0;
-                            let bestSmartStyle = '';
-
-                            rows.forEach((row, index) => {
-                                const styleCell = row.cells[3];
-                                if (!styleCell) return;
-
-                                const styleText = styleCell.textContent.trim();
-                                const normalizedStyle = normalize(styleText);
-
-                                // Count how many keywords match
-                                let score = 0;
-                                trimKeywords.forEach(keyword => {
-                                    if (normalizedStyle.includes(keyword)) {
-                                        score++;
-                                    }
-                                });
-
-                                // Need at least 50% of keywords to match
-                                const minScore = Math.ceil(trimKeywords.length / 2);
-                                if (score >= minScore && score > bestScore) {
-                                    bestScore = score;
-                                    bestSmartIndex = index;
-                                    bestSmartStyle = styleText;
-                                }
-                            });
-
-                            if (bestScore > 0) {
-                                bestIndex = bestSmartIndex;
-                                matchStrategy = 'trim-smart';
-                                matchedStyle = bestSmartStyle;
-                            }
-                        }
-
-                        // STRATEGY 2.5: Reverse keyword matching (modal keywords → trim)
-                        if (matchStrategy === 'mileage' && vehicleTrim && vehicleTrim.trim() !== '') {
-                            const normalizedTrim = normalize(vehicleTrim);
-
-                            // Common words to ignore (appear in almost all styles)
-                            const ignoreWords = ['SUV', '4D', '2D', 'DOOR', 'DR', 'SEDAN', 'WAGON', 'TRUCK', 'CAB', 'CREW', 'EXTENDED', 'REGULAR', 'QUAD', 'KING', 'DOUBLE'];
-
-                            let bestReverseScore = 0;
-                            let bestReverseIndex = 0;
-                            let bestReverseStyle = '';
-
-                            rows.forEach((row, index) => {
-                                const styleCell = row.cells[3];
-                                if (!styleCell) return;
-
-                                const styleText = styleCell.textContent.trim();
-                                const normalizedStyle = normalize(styleText);
-
-                                // Extract meaningful keywords from modal style
-                                const styleKeywords = normalizedStyle
-                                    .split(' ')
-                                    .filter(k => k.length > 2 && !ignoreWords.includes(k)); // Min 3 chars, not in ignore list
-
-                                if (styleKeywords.length === 0) return;
-
-                                // Count how many modal keywords are found in the trim
-                                let reverseScore = 0;
-                                styleKeywords.forEach(keyword => {
-                                    if (normalizedTrim.includes(keyword)) {
-                                        reverseScore++;
-                                    }
-                                });
-
-                                // Need at least 1 significant keyword match
-                                if (reverseScore > 0 && reverseScore > bestReverseScore) {
-                                    bestReverseScore = reverseScore;
-                                    bestReverseIndex = index;
-                                    bestReverseStyle = styleText;
-                                }
-                            });
-
-                            if (bestReverseScore > 0) {
-                                bestIndex = bestReverseIndex;
-                                matchStrategy = 'trim-reverse';
-                                matchedStyle = bestReverseStyle;
-                            }
-                        }
-
-                        // STRATEGY 3: Fallback to closest mileage
-                        if (matchStrategy === 'mileage') {
-                            rows.forEach((row, index) => {
-                                const avgOdoCell = row.cells[5]; // Avg Odo column
-                                if (!avgOdoCell) return;
-
-                                const mileageText = avgOdoCell.textContent.trim().replace(/,/g, '');
-                                const mileage = parseInt(mileageText);
-
-                                if (!isNaN(mileage)) {
-                                    const diff = Math.abs(mileage - targetMileage);
-                                    if (diff < smallestDiff) {
-                                        smallestDiff = diff;
-                                        bestIndex = index;
-                                    }
-                                }
-                            });
-
-                            // Get the matched style for mileage fallback
-                            const selectedRow = rows[bestIndex];
-                            if (selectedRow && selectedRow.cells[3]) {
-                                matchedStyle = selectedRow.cells[3].textContent.trim();
-                            }
-                        }
-
-                        return { bestIndex, matchStrategy, matchedStyle, availableStyles };
-                    }, { vehicleTrim: trim, targetMileage: mileage_miles });
-
-                    const { bestIndex: bestRowIndex, matchStrategy, matchedStyle, availableStyles } = selectionResult;
-
-                    // Log available styles
-                    console.log(`  📋 Available styles in modal:`);
-                    availableStyles.forEach(style => {
-                        console.log(`     ${style}`);
-                    });
-
-                    // Log match result
-                    if (matchStrategy === 'trim-exact') {
-                        console.log(`  🎯 Exact trim match! Database: "${trim}" → MMR: "${matchedStyle}"`);
-                    } else if (matchStrategy === 'trim-smart') {
-                        console.log(`  🧠 Smart keyword match! Database: "${trim}" → MMR: "${matchedStyle}"`);
-                    } else if (matchStrategy === 'trim-reverse') {
-                        console.log(`  🔄 Reverse keyword match! Database: "${trim}" → MMR: "${matchedStyle}"`);
-                    } else {
-                        console.log(`  ⚠️ No trim match found for "${trim || 'N/A'}"`);
-                        console.log(`  → Fallback: Selected by closest mileage (${mileage_miles} mi) → "${matchedStyle}"`);
-                    }
-                    console.log(`  → Selected: Row ${bestRowIndex + 1}`);
-
-                    // Click the selected row
-                    await mmrPage.evaluate((rowIndex) => {
-                        const rows = document.querySelectorAll('.styles__tableContainer__At0ta tbody tr');
-                        if (rows[rowIndex]) {
-                            rows[rowIndex].click();
-                        }
-                    }, bestRowIndex);
-
-                    console.log('  ✅ Style selected');
-
-                    // Wait for modal to close and page to update
-                    await humanDelay(2000, 3000);
-                } else {
-                    console.log('  → No modal - single vehicle style');
-                }
-
-                // STEP 5: Input mileage to get adjusted MMR
-                console.log(`\n📏 STEP 5: Inputting mileage for adjusted MMR...`);
-                console.log(`  → Target mileage: ${mileage_miles} miles`);
-
-                // Wait for odometer field to appear
-                console.log('  → Waiting for odometer input field...');
-                await mmrPage.waitForSelector('input#Odometer', { timeout: 10000 });
-                console.log('  ✅ Odometer input found');
-                await humanDelay(1000, 2000);
-
-                // Click the input field
-                console.log('  → Clicking odometer input...');
-                const odometerInput = mmrPage.locator('input#Odometer');
-                await odometerInput.click();
-                await humanDelay(300, 600);
-
-                // Clear any existing value
-                console.log('  → Clearing existing value...');
-                await odometerInput.fill('');
-                await humanDelay(300, 600);
-
-                // Type mileage character by character (human-like)
-                console.log(`  ⌨️ Typing mileage: ${mileage_miles}...`);
-                for (const char of mileage_miles.toString()) {
-                    await mmrPage.keyboard.type(char);
-                    await humanDelay(80, 200);
-                }
-                console.log('  ✅ Mileage typed');
-
-                // Click the submit button (checkmark icon)
-                console.log('  → Clicking submit button [aria-label="Submit odo"]...');
-                const submitButton = mmrPage.locator('button[aria-label="Submit odo"]');
-                await submitButton.click();
-                console.log('  ✅ Submit button clicked');
-
-                // Wait for MMR to recalculate with adjusted mileage
-                console.log('  ⏳ Waiting 4-6 seconds for MMR to recalculate...');
-                await humanDelay(4000, 6000);
-
-                // STEP 6: Extract MMR values (now adjusted for mileage)
-                console.log('\n📊 STEP 6: Extracting MMR values...');
-                const mmrValues = await extractMMRValues(mmrPage);
-
-                // Validate that we got data
-                if (!mmrValues.mmr_base_usd) {
-                    console.log('⚠️ Failed to extract MMR values');
-                    vinsFailed++;
-                    vinsProcessed++;
-                    continue;
-                }
-
-                // Capture the MMR dashboard URL for this vehicle
-                const mmrDashboardUrl = mmrPage.url();
-                console.log(`  → MMR Dashboard URL: ${mmrDashboardUrl}`);
-
-                // STEP 7: Send to n8n webhook
-                console.log('\n📤 STEP 7: Sending data to n8n webhook...');
-                const webhookPayload = {
-                    listing_id,
-                    vin,
-                    trim,
-                    mmr_base_usd: mmrValues.mmr_base_usd,
-                    mmr_adjusted_usd: mmrValues.mmr_adjusted_usd,
-                    mmr_range_min_usd: mmrValues.mmr_range_min_usd,
-                    mmr_range_max_usd: mmrValues.mmr_range_max_usd,
-                    estimated_retail_usd: mmrValues.estimated_retail_usd,
-                    mmr_dashboard_url: mmrDashboardUrl,
-                    cargurus_price_cad,
-                    cargurus_mileage_km,
-                    mileage_miles
-                };
-
-                console.log(`  → URL: ${n8nWebhookUrl}`);
-                console.log(`  → Payload: ${JSON.stringify(webhookPayload, null, 2)}`);
-
-                const webhookResponse = await fetch(n8nWebhookUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(webhookPayload)
-                });
-
-                if (webhookResponse.ok) {
-                    console.log(`  ✅ Webhook sent successfully (${webhookResponse.status})`);
-                    vinsSuccessful++;
-                } else {
-                    console.log(`  ⚠️ Webhook failed (${webhookResponse.status})`);
-                    vinsFailed++;
-                }
-
-                vinsProcessed++;
-
-                // Human-like delay between VINs
-                if (vinsProcessed < maxVINsPerRun) {
-                    const delayTime = Math.random() * (delayBetweenVINs[1] - delayBetweenVINs[0]) + delayBetweenVINs[0];
-                    console.log(`\n⏸️ Waiting ${(delayTime/1000).toFixed(1)}s before next VIN...`);
-                    await humanDelay(delayTime, delayTime + 1000);
-
-                    // Simulate some human activity during wait
-                    await simulateHumanScroll(mmrPage);
-                    await simulateHumanMouse(mmrPage);
-                }
-
-            } catch (vinError) {
-                console.error(`❌ Error processing VIN:`, vinError.message);
-                vinsFailed++;
-                vinsProcessed++;
-
-                // CRITICAL: Refresh the page to recover from error state
-                console.log('  🔄 Refreshing MMR tool to recover from error...');
-                try {
-                    await mmrPage.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
-                        waitUntil: 'domcontentloaded',
-                        timeout: 30000
-                    });
-                    await humanDelay(3000, 4000);
-                    console.log('  ✅ MMR tool refreshed and ready');
-                } catch (refreshError) {
-                    console.error('  ⚠️ Failed to refresh page:', refreshError.message);
-                }
-
-                // Wait before next VIN
-                await humanDelay(2000, 3000);
+            }
+
+            if (!cookiesChanged) {
+                console.log(`  ⚠️ Warning: Cookies did not change after ${maxAttempts} refreshes`);
+                console.log('  → Sending current cookies anyway (they may still be valid)');
             }
         }
 
-        // STEP 8: Summary
-        console.log(`\n${'='.repeat(60)}`);
-        console.log('📊 SCRAPING SUMMARY');
-        console.log(`${'='.repeat(60)}`);
-        console.log(`✅ Total VINs processed: ${vinsProcessed}`);
-        console.log(`✅ Successful: ${vinsSuccessful}`);
-        console.log(`❌ Failed: ${vinsFailed}`);
-        console.log(`${'='.repeat(60)}\n`);
+        // More human activity on homepage
+        console.log('  → Simulating human activity on homepage...');
+        await simulateHumanMouse(page);
+        await humanDelay(1000, 2000);
+
+        await simulateHumanScroll(page);
+        await humanDelay(1000, 2000);
+
+        await simulateHumanMouse(page);
+        await humanDelay(1000, 2000);
+
+        console.log('✅ Back on Manheim homepage - cookies should be fully refreshed');
+
+        // STEP 6: Extract fresh cookies from browser context
+        console.log('\n🍪 STEP 6: Extracting fresh cookies...');
+
+        const allCookies = await context.cookies();
+        console.log(`  → Total cookies in browser: ${allCookies.length}`);
+
+        // Filter for the 4 essential cookies
+        const essentialCookies = {
+            '_cl': null,
+            'SESSION': null,
+            'session': null,
+            'session.sig': null
+        };
+
+        const targetDomains = {
+            '_cl': '.manheim.com',
+            'SESSION': '.manheim.com',
+            'session': 'mcom-header-footer.manheim.com',
+            'session.sig': 'mcom-header-footer.manheim.com'
+        };
+
+        // Extract matching cookies
+        allCookies.forEach(cookie => {
+            if (essentialCookies.hasOwnProperty(cookie.name)) {
+                const expectedDomain = targetDomains[cookie.name];
+                if (cookie.domain === expectedDomain) {
+                    essentialCookies[cookie.name] = cookie;
+                    console.log(`  ✅ Found: ${cookie.name} (${cookie.domain})`);
+                }
+            }
+        });
+
+        // Verify all 4 cookies were found
+        const missingCookies = [];
+        Object.keys(essentialCookies).forEach(name => {
+            if (!essentialCookies[name]) {
+                missingCookies.push(name);
+                console.log(`  ❌ Missing: ${name}`);
+            }
+        });
+
+        if (missingCookies.length > 0) {
+            console.error(`\n❌ Failed to extract all cookies. Missing: ${missingCookies.join(', ')}`);
+
+            // Save all cookies for debugging
+            await Actor.setValue('all-cookies-debug', allCookies);
+            console.log('  → All cookies saved to key-value store for debugging');
+
+            throw new Error(`Missing cookies: ${missingCookies.join(', ')}`);
+        }
+
+        console.log('\n✅ All 4 essential cookies extracted successfully!');
+
+        // STEP 7: Prepare webhook payload
+        console.log('\n📤 STEP 7: Preparing webhook payload...');
+
+        const cookieArray = [
+            essentialCookies['_cl'],
+            essentialCookies['SESSION'],
+            essentialCookies['session'],
+            essentialCookies['session.sig']
+        ];
+
+        const webhookPayload = {
+            success: true,
+            timestamp: new Date().toISOString(),
+            cookies: cookieArray,
+            cookieDetails: {
+                _cl: {
+                    found: true,
+                    domain: essentialCookies['_cl'].domain,
+                    expires: essentialCookies['_cl'].expires || 'session'
+                },
+                SESSION: {
+                    found: true,
+                    domain: essentialCookies['SESSION'].domain,
+                    expires: essentialCookies['SESSION'].expires || 'session'
+                },
+                session: {
+                    found: true,
+                    domain: essentialCookies['session'].domain,
+                    expires: essentialCookies['session'].expires || 'session'
+                },
+                'session.sig': {
+                    found: true,
+                    domain: essentialCookies['session.sig'].domain,
+                    expires: essentialCookies['session.sig'].expires || 'session'
+                }
+            }
+        };
+
+        console.log('  → Payload prepared');
+        console.log('  → Cookie count: 4');
+        console.log('  → Timestamp:', webhookPayload.timestamp);
+
+        // STEP 8: Send to webhook
+        console.log('\n📤 STEP 8: Sending cookies to webhook...');
+        console.log(`  → URL: ${cookieWebhookUrl}`);
+
+        const webhookResponse = await fetch(cookieWebhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(webhookPayload)
+        });
+
+        if (webhookResponse.ok) {
+            console.log(`  ✅ Webhook sent successfully (${webhookResponse.status})`);
+            const responseText = await webhookResponse.text();
+            if (responseText) {
+                console.log(`  → Response: ${responseText}`);
+            }
+        } else {
+            console.log(`  ⚠️ Webhook failed (${webhookResponse.status})`);
+            const errorText = await webhookResponse.text();
+            console.log(`  → Error: ${errorText}`);
+            throw new Error(`Webhook failed with status ${webhookResponse.status}`);
+        }
+
+        // STEP 9: Save cookies to Apify KV store as backup
+        console.log('\n💾 STEP 9: Saving cookies to Apify KV store (backup)...');
+        await Actor.setValue('fresh-cookies', webhookPayload);
+        console.log('  ✅ Cookies saved to key-value store');
+
+        // STEP 10: Summary
+        console.log('\n' + '='.repeat(60));
+        console.log('✅ COOKIE REFRESH COMPLETED SUCCESSFULLY');
+        console.log('='.repeat(60));
+        console.log('📊 Summary:');
+        console.log('  • Cookies extracted: 4/4');
+        console.log('  • Webhook delivery: ✅ Success');
+        console.log('  • Backup saved: ✅ Yes');
+        console.log('  • Timestamp:', webhookPayload.timestamp);
+        console.log('='.repeat(60) + '\n');
 
     } catch (error) {
-        console.error('❌ Fatal error:', error.message);
-        throw error;
-    }
+        console.error('\n❌ Fatal error:', error.message);
 
-    await browser.close();
-    console.log('✅ Scraper completed successfully!');
+        // Send failure notification to webhook
+        try {
+            const failurePayload = {
+                success: false,
+                timestamp: new Date().toISOString(),
+                error: error.message,
+                cookies: null
+            };
+
+            await fetch(cookieWebhookUrl, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(failurePayload)
+            });
+
+            console.log('  → Failure notification sent to webhook');
+        } catch (webhookError) {
+            console.error('  → Failed to send failure notification:', webhookError.message);
+        }
+
+        throw error;
+    } finally {
+        await context.close();
+        console.log('🍪 Cookie refresher completed! Browser profile saved to ./manheim_browser_profile');
+    }
 });
