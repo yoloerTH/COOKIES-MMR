@@ -124,6 +124,16 @@ async function find2FAInput(page) {
     console.log('  → Finding 2FA code input field...');
 
     const inputSelector = await page.evaluate(() => {
+        // Try known MMR selectors first
+        const knownSelectors = ['#passcode', 'input[name="otp"]'];
+        for (const selector of knownSelectors) {
+            const input = document.querySelector(selector);
+            if (input) {
+                return selector;
+            }
+        }
+
+        // Fallback: Generic detection
         const inputs = Array.from(document.querySelectorAll('input'));
 
         // Try to find the most likely 2FA input
@@ -135,7 +145,7 @@ async function find2FAInput(page) {
             const maxLength = input.maxLength;
 
             // Strong indicators
-            const strongMatch = id.includes('code') || id.includes('otp') ||
+            const strongMatch = id.includes('code') || id.includes('otp') || id.includes('passcode') ||
                               name.includes('code') || name.includes('otp') ||
                               placeholder.includes('code');
 
@@ -455,12 +465,53 @@ await Actor.main(async () => {
                 // Enter 2FA code
                 console.log('  → Entering 2FA code...');
                 await page.fill(twoFAInput, twoFACode);
+                console.log('  ✅ Code entered');
+
+                // Wait for button to become enabled (checkInput() function needs to run)
+                console.log('  → Waiting for Sign In button to become enabled...');
                 await humanDelay(1000, 2000);
 
-                // Find and click submit button
-                console.log('  → Clicking 2FA submit button...');
-                const twoFASubmit = await page.locator('button[type="submit"], input[type="submit"], button:has-text("Submit"), button:has-text("Verify"), button:has-text("Continue")').first();
-                await twoFASubmit.click();
+                // Find submit button (try multiple selectors)
+                console.log('  → Looking for submit button...');
+                const buttonSelectors = [
+                    'button#sign-on',  // Specific to MMR
+                    'button:has-text("Sign In")',
+                    'button[type="submit"]',
+                    'input[type="submit"]',
+                    'button:has-text("Submit")',
+                    'button:has-text("Verify")',
+                    'button:has-text("Continue")'
+                ];
+
+                let twoFASubmit = null;
+                for (const selector of buttonSelectors) {
+                    try {
+                        const button = page.locator(selector).first();
+                        const count = await button.count();
+                        if (count > 0) {
+                            twoFASubmit = button;
+                            console.log(`  ✅ Found button: ${selector}`);
+                            break;
+                        }
+                    } catch (e) {
+                        // Try next selector
+                    }
+                }
+
+                if (!twoFASubmit) {
+                    throw new Error('Could not find 2FA submit button');
+                }
+
+                // Wait for button to be enabled (disabled attribute removed)
+                console.log('  → Waiting for button to be clickable...');
+                await twoFASubmit.waitFor({ state: 'visible', timeout: 10000 });
+
+                // Additional wait to ensure button is enabled
+                await humanDelay(500, 1000);
+
+                // Click submit button
+                console.log('  → Clicking Sign In button...');
+                await twoFASubmit.click({ force: false, timeout: 10000 });
                 console.log('  ✅ 2FA code submitted');
 
                 // Wait for 2FA verification
