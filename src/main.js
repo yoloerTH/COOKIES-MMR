@@ -186,17 +186,32 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     const blockingStatus = await page.evaluate(() => {
         const text = document.body.textContent.toLowerCase();
         const html = document.documentElement.innerHTML.toLowerCase();
+        const visibleText = document.body.innerText.toLowerCase();
+
+        // More specific CAPTCHA detection - look for actual CAPTCHA elements
+        const hasRecaptchaElement = !!document.querySelector('.g-recaptcha') ||
+                                   !!document.querySelector('[data-sitekey]') ||
+                                   !!document.querySelector('iframe[src*="recaptcha"]');
+
+        const hasHcaptchaElement = !!document.querySelector('.h-captcha') ||
+                                  !!document.querySelector('iframe[src*="hcaptcha"]');
+
+        const hasCaptchaIframe = !!document.querySelector('iframe[src*="captcha"]');
+
+        // Only flag as CAPTCHA if we see actual CAPTCHA UI elements or very specific text
+        const hasCaptchaChallenge = (visibleText.includes('complete the captcha') ||
+                                    visibleText.includes('solve the captcha') ||
+                                    visibleText.includes('verify you are human') ||
+                                    visibleText.includes('verify you\'re human') ||
+                                    visibleText.includes('i am not a robot')) &&
+                                   (hasRecaptchaElement || hasHcaptchaElement || hasCaptchaIframe);
 
         return {
-            hasCaptcha: text.includes('captcha') ||
-                       text.includes('verify you are human') ||
-                       text.includes('verify you\'re human'),
-            hasRecaptcha: !!document.querySelector('.g-recaptcha') ||
-                         !!document.querySelector('[data-sitekey]') ||
-                         html.includes('recaptcha'),
-            hasCloudflare: text.includes('cloudflare') ||
-                          text.includes('checking your browser') ||
-                          text.includes('challenge'),
+            hasCaptcha: hasCaptchaChallenge,
+            hasRecaptcha: hasRecaptchaElement,
+            hasHcaptcha: hasHcaptchaElement,
+            hasCloudflare: (text.includes('cloudflare') && text.includes('checking your browser')) ||
+                          (text.includes('challenge') && text.includes('ray id')),
             hasAccessDenied: text.includes('access denied') ||
                            text.includes('403 forbidden') ||
                            text.includes('not authorized'),
@@ -214,6 +229,9 @@ async function detectCaptchaOrBlocking(page, pageName = 'page') {
     }
     if (blockingStatus.hasRecaptcha) {
         console.log('  ⚠️ reCAPTCHA widget found!');
+    }
+    if (blockingStatus.hasHcaptcha) {
+        console.log('  ⚠️ hCaptcha widget found!');
     }
     if (blockingStatus.hasCloudflare) {
         console.log('  ⚠️ Cloudflare challenge detected!');
@@ -659,14 +677,46 @@ await Actor.main(async () => {
 
         console.log('✅ MMR tool loaded successfully');
 
-        // Check for CAPTCHA on MMR page
+        // Check if we landed on a login page instead of MMR tool
+        console.log('  → Checking if login is required...');
+        const isLoginPage = await detectLoginPage(mmrPage);
+
+        if (isLoginPage) {
+            console.log('  ⚠️ Login page detected in MMR popup - need to authenticate');
+
+            // Check if we have credentials
+            if (!credentials || !credentials.username || !credentials.password) {
+                throw new Error('Login required but no credentials provided');
+            }
+
+            // Perform login flow
+            await handleLoginFlow(mmrPage, credentials, twoFactorWebhookUrl);
+
+            // After login, wait for redirect to MMR tool
+            console.log('  → Waiting for redirect to MMR tool after login...');
+            await humanDelay(3000, 5000);
+
+            // Check if we're now on MMR tool
+            const currentUrl = mmrPage.url();
+            console.log(`  → Current URL after login: ${currentUrl}`);
+
+            if (currentUrl.includes('auth.manheim.com')) {
+                throw new Error('Still on auth page after login - authentication may have failed');
+            }
+        } else {
+            console.log('  ✅ Already authenticated - MMR tool is accessible');
+        }
+
+        // Now check for CAPTCHA (after login check)
+        console.log('  → Checking for CAPTCHA on MMR page...');
         const mmrBlocking = await detectCaptchaOrBlocking(mmrPage, 'MMR tool');
-        if (mmrBlocking.hasCaptcha || mmrBlocking.hasRecaptcha || mmrBlocking.hasCloudflare) {
+        if (mmrBlocking.hasCaptcha || mmrBlocking.hasRecaptcha || mmrBlocking.hasHcaptcha || mmrBlocking.hasCloudflare) {
             console.error('\n❌ CAPTCHA or challenge detected on MMR page!');
             const screenshot = await mmrPage.screenshot({ fullPage: false });
             await Actor.setValue('mmr-captcha-screenshot', screenshot, { contentType: 'image/png' });
             throw new Error('CAPTCHA on MMR tool - cannot proceed automatically');
         }
+        console.log('  ✅ No CAPTCHA detected');
 
         // STEP 4: More human activity on MMR page
         console.log('\n🖱️ STEP 4: Simulating human activity on MMR page...');
