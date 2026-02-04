@@ -286,8 +286,16 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
             // Parse 2FA code (try JSON first, fallback to plain text)
             try {
                 const jsonResponse = JSON.parse(responseText);
-                twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
-                console.log('  → Parsed as JSON');
+
+                // If JSON is a primitive (number or string), use it directly
+                if (typeof jsonResponse === 'number' || typeof jsonResponse === 'string') {
+                    twoFACode = String(jsonResponse).trim();
+                    console.log('  → Parsed as JSON primitive:', twoFACode);
+                } else if (typeof jsonResponse === 'object') {
+                    // If JSON is an object, look for code in known fields
+                    twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
+                    console.log('  → Parsed as JSON object');
+                }
             } catch (e) {
                 // Not JSON, treat as plain text
                 twoFACode = responseText.trim();
