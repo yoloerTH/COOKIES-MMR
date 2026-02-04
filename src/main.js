@@ -330,11 +330,27 @@ await Actor.main(async () => {
 
     console.log('  ✅ Persistent browser context ready');
 
-    // Inject cookies if provided (they will be added to persistent storage)
+    // Check if profile already has cookies
+    const existingCookies = await context.cookies();
+    const hasExistingCookies = existingCookies.some(c =>
+        c.name === '_cl' || c.name === 'SESSION'
+    );
+
+    if (hasExistingCookies) {
+        console.log(`\n🍪 Found ${existingCookies.length} existing cookies in browser profile`);
+    }
+
+    // Inject fresh cookies if provided (overwrites existing)
     if (manheimCookies && manheimCookies.length > 0) {
-        console.log('\n🍪 Injecting cookies into persistent browser...');
+        console.log('\n🍪 Injecting fresh cookies from input...');
         await context.addCookies(manheimCookies);
-        console.log('  ✅ Cookies injected successfully');
+        console.log(`  ✅ Injected ${manheimCookies.length} cookies (merged with profile)`);
+    } else if (!hasExistingCookies && !credentials) {
+        throw new Error('❌ No cookies in profile and no credentials provided - cannot proceed');
+    } else if (!hasExistingCookies) {
+        console.log('\n⚠️ No cookies in profile - will use credential login');
+    } else {
+        console.log('\n✅ Using existing cookies from browser profile');
     }
 
     const page = context.pages()[0] || await context.newPage();
