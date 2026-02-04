@@ -1057,6 +1057,14 @@ await Actor.main(async () => {
         const allCookies = await context.cookies();
         console.log(`  → Total cookies in browser: ${allCookies.length}`);
 
+        // Debug: Show all manheim cookies with their domains
+        console.log('\n  📋 All Manheim cookies found:');
+        const manheimCookiesDebug = allCookies.filter(c => c.domain.includes('manheim'));
+        manheimCookiesDebug.forEach(c => {
+            console.log(`     • ${c.name.padEnd(20)} → ${c.domain}`);
+        });
+        console.log('');
+
         // Filter for the 4 essential cookies
         const essentialCookies = {
             '_cl': null,
@@ -1065,18 +1073,11 @@ await Actor.main(async () => {
             'session.sig': null
         };
 
-        const targetDomains = {
-            '_cl': '.manheim.com',
-            'SESSION': '.manheim.com',
-            'session': 'mcom-header-footer.manheim.com',
-            'session.sig': 'mcom-header-footer.manheim.com'
-        };
-
-        // Extract matching cookies
+        // Extract matching cookies (accept from any manheim domain)
         allCookies.forEach(cookie => {
-            if (essentialCookies.hasOwnProperty(cookie.name)) {
-                const expectedDomain = targetDomains[cookie.name];
-                if (cookie.domain === expectedDomain) {
+            if (essentialCookies.hasOwnProperty(cookie.name) && !essentialCookies[cookie.name]) {
+                // Accept cookie from any manheim domain
+                if (cookie.domain.includes('manheim')) {
                     essentialCookies[cookie.name] = cookie;
                     console.log(`  ✅ Found: ${cookie.name} (${cookie.domain})`);
                 }
