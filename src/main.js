@@ -197,15 +197,47 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
     // Check "Remember my username" if available
     try {
         console.log('  → Checking "Remember my username"...');
-        await page.check('input#rememberUsername', { timeout: 2000 });
+        const checkbox = await page.locator('input#rememberUsername, input[name="pf.rememberUsername"]').first();
+        await checkbox.check({ timeout: 3000 });
+        console.log('  ✅ Remember username checked');
         await humanDelay(500, 1000);
     } catch (e) {
         console.log('  → Remember username checkbox not found (skipping)');
     }
 
-    // Find and click submit button
-    console.log('  → Clicking submit button...');
-    const submitButton = await page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")').first();
+    // Find and click submit button (MMR uses <a> tag with id="signOnButton")
+    console.log('  → Looking for Sign In button...');
+    const submitSelectors = [
+        'a#signOnButton',  // MMR specific
+        'button#signOnButton',
+        'a.ping-button:has-text("Sign In")',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Sign In")',
+        'button:has-text("Log In")',
+        'a:has-text("Sign In")'
+    ];
+
+    let submitButton = null;
+    for (const selector of submitSelectors) {
+        try {
+            const button = page.locator(selector).first();
+            const count = await button.count();
+            if (count > 0) {
+                submitButton = button;
+                console.log(`  ✅ Found Sign In button: ${selector}`);
+                break;
+            }
+        } catch (e) {
+            // Try next selector
+        }
+    }
+
+    if (!submitButton) {
+        throw new Error('Could not find Sign In button');
+    }
+
+    console.log('  → Clicking Sign In button...');
     await submitButton.click();
     console.log('  ✅ Login form submitted');
 
