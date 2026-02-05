@@ -904,34 +904,54 @@ await Actor.main(async () => {
 
         console.log('✅ MMR tool loaded successfully');
 
-        // Check if we landed on a login page instead of MMR tool
-        console.log('  → Checking if login is required...');
-        const isMMRLoginPage = await detectLoginPage(mmrPage);
+        // Check if we're already on MMR tool (auto-redirect happened)
+        let currentUrl = mmrPage.url();
+        console.log(`  → Current URL: ${currentUrl}`);
 
-        if (isMMRLoginPage) {
-            console.log('  ⚠️ Login page detected in MMR popup - need to authenticate');
-
-            // Check if we have credentials
-            if (!credentials || !credentials.username || !credentials.password) {
-                throw new Error('Login required but no credentials provided');
-            }
-
-            // Perform login flow
-            await handleLoginFlow(mmrPage, credentials, twoFactorWebhookUrl);
-
-            // After login, wait for redirect to MMR tool
-            console.log('  → Waiting for redirect to MMR tool after login...');
+        if (currentUrl.includes('mmr.manheim.com')) {
+            console.log('  ✅ Already on MMR tool - cookies are valid, no login needed!');
+        } else if (currentUrl.includes('auth.manheim.com')) {
+            // We're on auth page - wait a bit for potential auto-redirect
+            console.log('  → On auth page, waiting for potential auto-redirect...');
             await humanDelay(3000, 5000);
 
-            // Check if we're now on MMR tool
-            const currentUrl = mmrPage.url();
-            console.log(`  → Current URL after login: ${currentUrl}`);
+            // Check URL again after waiting
+            currentUrl = mmrPage.url();
+            console.log(`  → URL after waiting: ${currentUrl}`);
 
-            if (currentUrl.includes('auth.manheim.com')) {
-                throw new Error('Still on auth page after login - authentication may have failed');
+            if (currentUrl.includes('mmr.manheim.com')) {
+                console.log('  ✅ Auto-redirected to MMR tool - cookies are valid!');
+            } else {
+                // Still on auth page - check if login form is displayed
+                console.log('  → Still on auth page, checking if login is required...');
+                const isMMRLoginPage = await detectLoginPage(mmrPage);
+
+                if (isMMRLoginPage) {
+                    console.log('  ⚠️ Login page detected in MMR popup - need to authenticate');
+
+                    // Check if we have credentials
+                    if (!credentials || !credentials.username || !credentials.password) {
+                        throw new Error('Login required but no credentials provided');
+                    }
+
+                    // Perform login flow
+                    await handleLoginFlow(mmrPage, credentials, twoFactorWebhookUrl);
+
+                    // After login, wait for redirect to MMR tool
+                    console.log('  → Waiting for redirect to MMR tool after login...');
+                    await humanDelay(3000, 5000);
+
+                    // Check if we're now on MMR tool
+                    const urlAfterLogin = mmrPage.url();
+                    console.log(`  → Current URL after login: ${urlAfterLogin}`);
+
+                    if (urlAfterLogin.includes('auth.manheim.com')) {
+                        throw new Error('Still on auth page after login - authentication may have failed');
+                    }
+                } else {
+                    console.log('  ✅ No login form detected - session may be valid');
+                }
             }
-        } else {
-            console.log('  ✅ Already authenticated - MMR tool is accessible');
         }
 
         // Now check for CAPTCHA (after login check)
@@ -972,37 +992,67 @@ await Actor.main(async () => {
             console.log('  → Continuing without button click...');
         }
 
-        // STEP 5: Navigate back using browser back button (like manual process)
-        console.log('\n🔙 STEP 5: Using browser back button to return...');
-        console.log('  → This mimics the manual cookie extraction process');
+        // OPTION 1: Close popup and navigate to MMR on main page
+        console.log('\n🔄 STEP 5: Closing popup and opening MMR on main page...');
+        console.log('  → This ensures full page load with all components (header/footer)');
 
-        // Use browser back button (like manual process)
-        await page.goBack({ waitUntil: 'domcontentloaded' });
-        console.log('  ✅ Returned to previous page using back button');
+        // Close the popup
+        console.log('  → Closing MMR popup...');
+        await mmrPage.close();
+        console.log('  ✅ Popup closed');
 
-        console.log('  → Waiting 3-5 seconds for cookies to settle...');
-        await humanDelay(3000, 5000);
+        // Wait a bit for cookies to sync
+        await humanDelay(2000, 3000);
 
-        // Visit main homepage to trigger header/footer cookies (session and session.sig)
-        console.log('\n🌐 STEP 5.3: Visiting main homepage to trigger all cookies...');
-        console.log('  → Navigating to https://www.manheim.com/...');
-        await page.goto('https://www.manheim.com/', {
+        // Now navigate to MMR tool on the MAIN page (not popup)
+        console.log('  → Navigating to MMR tool on main page...');
+        console.log('  → URL: https://mmr.manheim.com/?country=US&source=man');
+        await page.goto('https://mmr.manheim.com/?country=US&source=man', {
             waitUntil: 'domcontentloaded',
-            timeout: 30000
+            timeout: 90000
         });
-        console.log('  ✅ Homepage loaded');
+        console.log('  ✅ MMR tool loaded on main page');
 
-        console.log('  → Waiting for header/footer to load...');
-        await humanDelay(4000, 6000);
+        // Wait for page to fully load with all components
+        console.log('  → Waiting for full page load (including header/footer)...');
+        await humanDelay(5000, 7000);
 
-        console.log('  → Returning to site.manheim.com...');
+        // Check if we're on MMR tool or got redirected
+        const finalUrl = page.url();
+        console.log(`  → Current URL: ${finalUrl}`);
+
+        if (!finalUrl.includes('mmr.manheim.com')) {
+            console.log('  ⚠️ Not on MMR page - may have been redirected');
+        } else {
+            console.log('  ✅ On MMR tool page');
+        }
+
+        // Simulate human activity on full page
+        console.log('  → Simulating human activity...');
+        await simulateHumanMouse(page);
+        await humanDelay(2000, 3000);
+        await simulateHumanScroll(page);
+        await humanDelay(2000, 3000);
+
+        // Click VIN input on main page
+        console.log('  → Clicking VIN input on main page...');
+        try {
+            await page.click('#vinText', { timeout: 5000 });
+            console.log('  ✅ VIN input clicked');
+            await humanDelay(1000, 2000);
+        } catch (error) {
+            console.log(`  ⚠️ Could not click VIN input: ${error.message}`);
+        }
+
+        // Return to homepage
+        console.log('  → Returning to site homepage...');
         await page.goto('https://site.manheim.com/', {
             waitUntil: 'domcontentloaded',
             timeout: 30000
         });
         console.log('  ✅ Back on site page');
 
-        console.log('  → Waiting for cookies to sync...');
+        console.log('  → Waiting for cookies to settle...');
         await humanDelay(3000, 5000);
 
         // STEP 5.5: Check if cookies changed, if not perform max 3 hard refreshes
@@ -1106,23 +1156,91 @@ await Actor.main(async () => {
             }
         });
 
-        // Verify all 4 cookies were found
-        const missingCookies = [];
-        Object.keys(essentialCookies).forEach(name => {
-            if (!essentialCookies[name]) {
-                missingCookies.push(name);
-                console.log(`  ❌ Missing: ${name}`);
-            }
-        });
+        // Verify required cookies were found (_cl and SESSION are critical)
+        const missingRequired = [];
+        const missingOptional = [];
 
-        if (missingCookies.length > 0) {
-            console.error(`\n❌ Failed to extract all cookies. Missing: ${missingCookies.join(', ')}`);
+        if (!essentialCookies['_cl']) {
+            missingRequired.push('_cl');
+            console.log(`  ❌ Missing (REQUIRED): _cl`);
+        }
+        if (!essentialCookies['SESSION']) {
+            missingRequired.push('SESSION');
+            console.log(`  ❌ Missing (REQUIRED): SESSION`);
+        }
+
+        if (!essentialCookies['session']) {
+            missingOptional.push('session');
+            console.log(`  ⚠️ Missing: session`);
+        }
+        if (!essentialCookies['session.sig']) {
+            missingOptional.push('session.sig');
+            console.log(`  ⚠️ Missing: session.sig`);
+        }
+
+        if (missingRequired.length > 0) {
+            console.error(`\n❌ Failed to extract required cookies. Missing: ${missingRequired.join(', ')}`);
 
             // Save all cookies for debugging
             await Actor.setValue('all-cookies-debug', allCookies);
             console.log('  → All cookies saved to key-value store for debugging');
 
-            throw new Error(`Missing cookies: ${missingCookies.join(', ')}`);
+            throw new Error(`Missing required cookies: ${missingRequired.join(', ')}`);
+        }
+
+        // OPTION 2: If session/session.sig missing, try direct request to mcom-header-footer
+        if (missingOptional.length > 0) {
+            console.log(`\n⚠️ Cookies missing: ${missingOptional.join(', ')}`);
+            console.log('🔄 OPTION 2 (Fallback): Attempting direct request to mcom-header-footer.manheim.com...');
+
+            try {
+                // Navigate to main Manheim homepage
+                console.log('  → Navigating to https://www.manheim.com/...');
+                await page.goto('https://www.manheim.com/', {
+                    waitUntil: 'networkidle',
+                    timeout: 30000
+                });
+                console.log('  ✅ Homepage loaded');
+
+                // Wait for all components to load
+                console.log('  → Waiting for header/footer component to load...');
+                await humanDelay(5000, 7000);
+
+                // Check for mcom-header-footer requests in network
+                console.log('  → Checking if mcom-header-footer component loaded...');
+
+                // Re-extract cookies
+                console.log('  → Re-extracting cookies...');
+                const updatedCookies = await context.cookies();
+
+                // Check for session cookies again
+                updatedCookies.forEach(cookie => {
+                    if ((cookie.name === 'session' || cookie.name === 'session.sig') &&
+                        cookie.domain.includes('manheim') &&
+                        !essentialCookies[cookie.name]) {
+                        essentialCookies[cookie.name] = cookie;
+                        console.log(`  ✅ Found after fallback: ${cookie.name} (${cookie.domain})`);
+                        const index = missingOptional.indexOf(cookie.name);
+                        if (index > -1) missingOptional.splice(index, 1);
+                    }
+                });
+
+                if (missingOptional.length > 0) {
+                    console.log(`  ⚠️ Still missing after fallback: ${missingOptional.join(', ')}`);
+                    console.log('  ❌ These cookies may not be available in automated flow');
+
+                    // Save all cookies for debugging
+                    await Actor.setValue('all-cookies-debug-after-fallback', updatedCookies);
+                    console.log('  → All cookies saved to key-value store for debugging');
+
+                    throw new Error(`Missing required cookies: ${missingOptional.join(', ')} - Could not extract after multiple attempts`);
+                } else {
+                    console.log('  ✅ All cookies found after fallback!');
+                }
+            } catch (error) {
+                console.error(`  ❌ Fallback failed: ${error.message}`);
+                throw new Error(`Missing required cookies: ${missingOptional.join(', ')} - Fallback also failed`);
+            }
         }
 
         console.log('\n✅ All 4 essential cookies extracted successfully!');
@@ -1130,12 +1248,13 @@ await Actor.main(async () => {
         // STEP 7: Prepare webhook payload
         console.log('\n📤 STEP 7: Preparing webhook payload...');
 
+        // Only include cookies that were found
         const cookieArray = [
             essentialCookies['_cl'],
             essentialCookies['SESSION'],
             essentialCookies['session'],
             essentialCookies['session.sig']
-        ];
+        ].filter(c => c !== null);
 
         const webhookPayload = {
             success: true,
@@ -1143,24 +1262,24 @@ await Actor.main(async () => {
             cookies: cookieArray,
             cookieDetails: {
                 _cl: {
-                    found: true,
-                    domain: essentialCookies['_cl'].domain,
-                    expires: essentialCookies['_cl'].expires || 'session'
+                    found: !!essentialCookies['_cl'],
+                    domain: essentialCookies['_cl']?.domain,
+                    expires: essentialCookies['_cl']?.expires || 'session'
                 },
                 SESSION: {
-                    found: true,
-                    domain: essentialCookies['SESSION'].domain,
-                    expires: essentialCookies['SESSION'].expires || 'session'
+                    found: !!essentialCookies['SESSION'],
+                    domain: essentialCookies['SESSION']?.domain,
+                    expires: essentialCookies['SESSION']?.expires || 'session'
                 },
                 session: {
-                    found: true,
-                    domain: essentialCookies['session'].domain,
-                    expires: essentialCookies['session'].expires || 'session'
+                    found: !!essentialCookies['session'],
+                    domain: essentialCookies['session']?.domain || 'mcom-header-footer.manheim.com',
+                    expires: essentialCookies['session']?.expires || 'session'
                 },
                 'session.sig': {
-                    found: true,
-                    domain: essentialCookies['session.sig'].domain,
-                    expires: essentialCookies['session.sig'].expires || 'session'
+                    found: !!essentialCookies['session.sig'],
+                    domain: essentialCookies['session.sig']?.domain || 'mcom-header-footer.manheim.com',
+                    expires: essentialCookies['session.sig']?.expires || 'session'
                 }
             }
         };
