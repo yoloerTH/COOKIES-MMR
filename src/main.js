@@ -983,6 +983,28 @@ await Actor.main(async () => {
         console.log('  → Waiting 3-5 seconds for cookies to settle...');
         await humanDelay(3000, 5000);
 
+        // Visit main homepage to trigger header/footer cookies (session and session.sig)
+        console.log('\n🌐 STEP 5.3: Visiting main homepage to trigger all cookies...');
+        console.log('  → Navigating to https://www.manheim.com/...');
+        await page.goto('https://www.manheim.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+        });
+        console.log('  ✅ Homepage loaded');
+
+        console.log('  → Waiting for header/footer to load...');
+        await humanDelay(4000, 6000);
+
+        console.log('  → Returning to site.manheim.com...');
+        await page.goto('https://site.manheim.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 30000
+        });
+        console.log('  ✅ Back on site page');
+
+        console.log('  → Waiting for cookies to sync...');
+        await humanDelay(3000, 5000);
+
         // STEP 5.5: Check if cookies changed, if not perform max 3 hard refreshes
         console.log('\n🔄 STEP 5.5: Checking if cookies changed...');
 
