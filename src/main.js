@@ -785,21 +785,53 @@ await Actor.main(async () => {
 
         console.log('✅ STEP 1 complete - authentication handled');
 
-        // STEP 2: Simulate human activity
-        console.log('\n🖱️ STEP 2: Simulating human activity...');
-        console.log('  → Mouse movement...');
+        // STEP 2: Visit www.manheim.com to trigger mcom-header-footer iframe cookies
+        // This is the KEY step for getting session + session.sig cookies
+        console.log('\n🌐 STEP 2: Visiting www.manheim.com to trigger iframe cookies...');
+        console.log('  → The mcom-header-footer iframe sets session + session.sig cookies');
+        await page.goto('https://www.manheim.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 90000
+        });
+        console.log('  ✅ Page loaded');
+
+        // Wait for full page load including iframes
+        await humanDelay(3000, 5000);
+
+        // Actively wait for the mcom-header-footer iframe to appear
+        console.log('  → Looking for mcom-header-footer iframe...');
+        let headerFooterFrameFound = false;
+        try {
+            await page.waitForSelector('iframe[src*="mcom-header-footer"]', { timeout: 15000 });
+            headerFooterFrameFound = true;
+            console.log('  ✅ mcom-header-footer iframe found in DOM');
+
+            // Also check via frames() API for the actual frame context
+            const frames = page.frames();
+            const mcomFrame = frames.find(f => f.url().includes('mcom-header-footer'));
+            if (mcomFrame) {
+                console.log(`  ✅ Frame loaded: ${mcomFrame.url().substring(0, 80)}...`);
+                // Wait for the frame to fully load (this is when cookies get set)
+                await mcomFrame.waitForLoadState('domcontentloaded').catch(() => {});
+                console.log('  ✅ mcom-header-footer frame fully loaded');
+            }
+
+            // Give the server time to set cookies after iframe loads
+            await humanDelay(3000, 5000);
+        } catch {
+            console.log('  ⚠️ mcom-header-footer iframe not found (may not be available yet)');
+        }
+
+        // Simulate human activity
+        console.log('  → Simulating human activity...');
         await simulateHumanMouse(page);
         await humanDelay(1000, 2000);
-
-        console.log('  → Scrolling...');
         await simulateHumanScroll(page);
         await humanDelay(1000, 2000);
-
-        console.log('  → More mouse movement...');
         await simulateHumanMouse(page);
         await humanDelay(1000, 2000);
 
-        console.log('✅ Human activity simulated');
+        console.log('✅ STEP 2 complete');
 
         // STEP 3: Access MMR tool to ensure full cookie refresh
         console.log('\n📊 STEP 3: Accessing MMR tool to refresh cookies...');
@@ -1046,13 +1078,13 @@ await Actor.main(async () => {
             console.log(`  ⚠️ Could not click VIN input: ${error.message}`);
         }
 
-        // Return to homepage
-        console.log('  → Returning to site homepage...');
-        await page.goto('https://site.manheim.com/', {
+        // Return to www.manheim.com (NOT site.manheim.com which is public/no iframe)
+        console.log('  → Returning to www.manheim.com (has mcom-header-footer iframe)...');
+        await page.goto('https://www.manheim.com/', {
             waitUntil: 'domcontentloaded',
             timeout: 30000
         });
-        console.log('  ✅ Back on site page');
+        console.log('  ✅ Back on www.manheim.com');
 
         console.log('  → Waiting for cookies to settle...');
         await humanDelay(3000, 5000);
@@ -1198,22 +1230,36 @@ await Actor.main(async () => {
         let isPartial = false;
         if (missingOptional.length > 0) {
             console.log(`\n⚠️ Optional cookies missing: ${missingOptional.join(', ')}`);
-            console.log('🔄 Attempting to load mcom-header-footer iframe via www.manheim.com...');
+            console.log('🔄 Fallback: Reloading www.manheim.com to trigger mcom-header-footer iframe...');
 
             try {
+                // Fresh navigation to www.manheim.com with networkidle (wait for all requests)
                 await page.goto('https://www.manheim.com/', {
                     waitUntil: 'networkidle',
                     timeout: 30000
                 });
-                console.log('  ✅ Homepage loaded');
+                console.log('  ✅ Homepage loaded (networkidle)');
 
-                // Wait specifically for the mcom-header-footer iframe
+                // Wait for iframe in DOM
                 console.log('  → Waiting for mcom-header-footer iframe...');
                 try {
-                    await page.waitForSelector('iframe[src*="mcom-header-footer"]', { timeout: 10000 });
-                    console.log('  ✅ Found mcom-header-footer iframe');
+                    await page.waitForSelector('iframe[src*="mcom-header-footer"]', { timeout: 15000 });
+                    console.log('  ✅ Found mcom-header-footer iframe in DOM');
                 } catch {
                     console.log('  ⚠️ mcom-header-footer iframe not found in DOM');
+                }
+
+                // Also check via frames() API and wait for frame to load
+                const fallbackFrames = page.frames();
+                const mcomFallbackFrame = fallbackFrames.find(f => f.url().includes('mcom-header-footer'));
+                if (mcomFallbackFrame) {
+                    console.log(`  ✅ Found mcom-header-footer frame context: ${mcomFallbackFrame.url().substring(0, 80)}...`);
+                    await mcomFallbackFrame.waitForLoadState('domcontentloaded').catch(() => {});
+                    console.log('  ✅ Frame fully loaded - cookies should be set');
+                    await humanDelay(3000, 5000);
+                } else {
+                    console.log('  ⚠️ mcom-header-footer frame not found in frames() - listing available frames:');
+                    fallbackFrames.forEach(f => console.log(`     • ${f.url().substring(0, 100)}`));
                 }
 
                 // Retry loop: poll for cookies up to 3 times
