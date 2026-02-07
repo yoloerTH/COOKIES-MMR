@@ -1,9 +1,108 @@
 import { Actor } from 'apify';
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import { execSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
 // Add stealth plugin
 chromium.use(StealthPlugin());
+
+// ============================================
+// BROWSER PROFILE PERSISTENCE
+// ============================================
+
+const PROFILE_DIR = './manheim_browser_profile';
+const PROFILE_KV_KEY = 'browser-profile';
+const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
+
+// Directories to exclude when saving (large/unnecessary cache files)
+const EXCLUDE_DIRS = [
+    'Cache', 'Code Cache', 'GPUCache', 'ShaderCache',
+    'Service Worker', 'blob_storage', 'BrowserMetrics',
+    'crash_reports', 'component_cracked_packs', 'GrShaderCache',
+    'optimization_guide_prediction_model_downloads',
+];
+
+async function restoreBrowserProfile() {
+    console.log('\n💾 Checking for saved browser profile in KV store...');
+
+    try {
+        const profileData = await Actor.getValue(PROFILE_KV_KEY);
+
+        if (!profileData) {
+            console.log('  → No saved profile found - starting fresh');
+            return false;
+        }
+
+        // profileData is a Buffer from KV store
+        const buffer = Buffer.from(profileData);
+        console.log(`  → Found saved profile (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+
+        // Write tarball to disk
+        fs.writeFileSync(PROFILE_TAR, buffer);
+
+        // Create profile directory and extract
+        fs.mkdirSync(PROFILE_DIR, { recursive: true });
+        execSync(`tar xzf ${PROFILE_TAR} -C ${PROFILE_DIR}`, { stdio: 'pipe' });
+
+        // Clean up tarball
+        fs.unlinkSync(PROFILE_TAR);
+
+        console.log('  ✅ Browser profile restored from KV store');
+        return true;
+    } catch (error) {
+        console.log(`  ⚠️ Failed to restore profile: ${error.message}`);
+        console.log('  → Starting with fresh profile');
+        return false;
+    }
+}
+
+async function saveBrowserProfile() {
+    console.log('\n💾 Saving browser profile to KV store...');
+
+    try {
+        if (!fs.existsSync(PROFILE_DIR)) {
+            console.log('  ⚠️ Profile directory does not exist - nothing to save');
+            return false;
+        }
+
+        // Build tar exclude flags
+        const excludeFlags = EXCLUDE_DIRS.map(d => `--exclude='${d}'`).join(' ');
+
+        // Create tarball (from inside profile dir so paths are relative)
+        execSync(`tar czf ${PROFILE_TAR} ${excludeFlags} -C ${PROFILE_DIR} .`, { stdio: 'pipe' });
+
+        // Read tarball
+        const tarData = fs.readFileSync(PROFILE_TAR);
+        const sizeMB = (tarData.length / 1024 / 1024).toFixed(2);
+        console.log(`  → Profile size: ${sizeMB} MB`);
+
+        // Save to KV store (binary data, application/octet-stream)
+        await Actor.setValue(PROFILE_KV_KEY, tarData, { contentType: 'application/octet-stream' });
+
+        // Clean up tarball
+        fs.unlinkSync(PROFILE_TAR);
+
+        console.log(`  ✅ Browser profile saved to KV store (${sizeMB} MB)`);
+        return true;
+    } catch (error) {
+        console.log(`  ⚠️ Failed to save profile: ${error.message}`);
+        return false;
+    }
+}
+
+// ============================================
+// URL HELPER
+// ============================================
+
+function getHostname(url) {
+    try {
+        return new URL(url).hostname;
+    } catch {
+        return '';
+    }
+}
 
 // ============================================
 // HUMAN-LIKE BEHAVIOR HELPERS
@@ -183,6 +282,10 @@ async function find2FAInput(page) {
 async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
     console.log('\n🔐 LOGIN FLOW: Entering credentials...');
     console.log(`  → Username: ${credentials.username}`);
+
+    // Wait for login form to be ready
+    console.log('  → Waiting for login form to load...');
+    await page.waitForSelector('input#username', { timeout: 15000 });
 
     // Fill username
     console.log('  → Filling username field...');
@@ -547,9 +650,12 @@ await Actor.main(async () => {
         console.log('\n🌍 No proxy - using direct connection');
     }
 
+    // Restore browser profile from KV store (if available from previous run)
+    const profileRestored = await restoreBrowserProfile();
+
     // Launch PERSISTENT browser context (preserves cookies/storage between runs)
     console.log('\n🌐 Launching persistent browser context...');
-    console.log('  → Profile: ./manheim_browser_profile');
+    console.log(`  → Profile: ${PROFILE_DIR} (${profileRestored ? 'restored from KV store' : 'fresh'})`);
 
     const contextOptions = {
         viewport: { width: 1920, height: 1080 },
@@ -568,7 +674,7 @@ await Actor.main(async () => {
         contextOptions.proxy = { server: proxyUrl };
     }
 
-    const context = await chromium.launchPersistentContext('./manheim_browser_profile', contextOptions);
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, contextOptions);
 
     // Set default navigation timeout
     context.setDefaultNavigationTimeout(90000);
@@ -601,189 +707,83 @@ await Actor.main(async () => {
     const page = context.pages()[0] || await context.newPage();
 
     try {
-        // STEP 1: Visit Manheim site homepage to trigger session refresh
-        console.log('\n🌐 STEP 1: Visiting Manheim site homepage...');
-        console.log('  → Navigating to: https://site.manheim.com/');
+        // STEP 1: Authenticate (cookies warm-up OR credential login)
+        console.log('\n🌐 STEP 1: Checking authentication status...');
 
-        await page.goto('https://site.manheim.com/', {
-            waitUntil: 'domcontentloaded',
-            timeout: 90000
-        });
-        console.log('  ✅ Page loaded (domcontentloaded)');
+        const hasInputCookies = manheimCookies && manheimCookies.length > 0;
+        const hasCredentials = credentials && credentials.username && credentials.password;
 
-        console.log('  → Waiting 4-6 seconds for page to fully load...');
-        await humanDelay(4000, 6000);
-
-        // Check for CAPTCHA or blocking
-        const homeBlocking = await detectCaptchaOrBlocking(page, 'Manheim home');
-        if (homeBlocking.hasCaptcha || homeBlocking.hasRecaptcha || homeBlocking.hasCloudflare) {
-            console.error('\n❌ CAPTCHA or challenge detected on home page!');
-            const screenshot = await page.screenshot({ fullPage: false });
-            await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
-            throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
-        }
-
-        // Check if login page appeared (cookies invalid)
-        const isLoginPage = await detectLoginPage(page);
-        if (isLoginPage) {
-            if (!credentials || !credentials.username || !credentials.password) {
-                console.error('\n❌ Login page detected but no credentials provided!');
-                const screenshot = await page.screenshot({ fullPage: false });
-                await Actor.setValue('login-required-screenshot', screenshot, { contentType: 'image/png' });
-                throw new Error('Session expired and credentials not provided - cannot proceed');
-            }
-
-            // CREDENTIAL LOGIN FLOW
-            console.log('\n🔐 LOGIN FLOW: Entering credentials...');
-            console.log(`  → Username: ${credentials.username}`);
-
-            // Fill username
-            console.log('  → Filling username field...');
-            await page.fill('input#username', credentials.username);
-            await humanDelay(500, 1000);
-
-            // Fill password
-            console.log('  → Filling password field...');
-            await page.fill('input#password', credentials.password);
-            await humanDelay(500, 1000);
-
-            // Check "Remember my username"
-            console.log('  → Checking "Remember my username"...');
-            await page.check('input#rememberUsername');
-            await humanDelay(500, 1000);
-
-            // Find and click submit button
-            console.log('  → Clicking submit button...');
-            const submitButton = await page.locator('button[type="submit"], input[type="submit"], button:has-text("Sign In"), button:has-text("Log In")').first();
-            await submitButton.click();
-            console.log('  ✅ Login form submitted');
-
-            // Wait for navigation after login
-            console.log('  → Waiting for page to load after login...');
+        if (hasInputCookies) {
+            // COOKIES PATH: Visit site.manheim.com to warm up injected cookies
+            console.log('  → Warming up injected cookies via site.manheim.com...');
+            await page.goto('https://site.manheim.com/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 90000
+            });
+            console.log('  ✅ Page loaded');
             await humanDelay(4000, 6000);
 
-            // Check if 2FA page appeared
-            const is2FAPage = await detect2FAPage(page);
-            if (is2FAPage) {
-                console.log('\n🔐 2FA FLOW: Getting verification code...');
-
-                // Find 2FA input field
-                const twoFAInput = await find2FAInput(page);
-                if (!twoFAInput) {
-                    console.error('❌ Could not find 2FA input field!');
-                    const screenshot = await page.screenshot({ fullPage: false });
-                    await Actor.setValue('2fa-input-not-found-screenshot', screenshot, { contentType: 'image/png' });
-                    throw new Error('2FA page detected but input field not found');
-                }
-
-                // Call 2FA webhook and wait for code (2.5 minute timeout)
-                console.log(`  → Calling 2FA webhook: ${twoFactorWebhookUrl}`);
-                console.log('  → Waiting up to 2.5 minutes for your response...');
-
-                let twoFACode = null;
-                try {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 150000); // 2.5 minutes
-
-                    const twoFAResponse = await fetch(twoFactorWebhookUrl, {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ username: credentials.username }),
-                        signal: controller.signal
-                    }).finally(() => clearTimeout(timeoutId));
-
-                    if (!twoFAResponse.ok) {
-                        const errorText = await twoFAResponse.text().catch(() => 'No error details');
-                        throw new Error(`2FA webhook failed with status ${twoFAResponse.status}: ${errorText}`);
-                    }
-
-                    const responseText = await twoFAResponse.text();
-                    console.log(`  → Webhook response received: ${responseText.substring(0, 100)}...`);
-
-                    // Parse 2FA code (try JSON first, fallback to plain text)
-                    try {
-                        const jsonResponse = JSON.parse(responseText);
-                        twoFACode = jsonResponse.code || jsonResponse['2fa_code'] || jsonResponse.otp || jsonResponse.token;
-                        console.log('  → Parsed as JSON');
-                    } catch (e) {
-                        // Not JSON, treat as plain text
-                        twoFACode = responseText.trim();
-                        console.log('  → Parsed as plain text');
-                    }
-
-                    if (!twoFACode) {
-                        throw new Error('2FA webhook response did not contain a code');
-                    }
-                } catch (error) {
-                    if (error.name === 'AbortError') {
-                        throw new Error('2FA webhook timed out after 2.5 minutes - no response received');
-                    }
-                    throw error;
-                }
-
-                console.log(`  ✅ 2FA code received: ${twoFACode}`);
-
-                // Enter 2FA code
-                console.log('  → Entering 2FA code...');
-                await page.fill(twoFAInput, twoFACode);
-                console.log('  ✅ Code entered');
-
-                // Wait for button to become enabled (checkInput() function needs to run)
-                console.log('  → Waiting for Sign In button to become enabled...');
-                await humanDelay(1000, 2000);
-
-                // Find submit button (try multiple selectors)
-                console.log('  → Looking for submit button...');
-                const buttonSelectors = [
-                    'button#sign-on',  // Specific to MMR
-                    'button:has-text("Sign In")',
-                    'button[type="submit"]',
-                    'input[type="submit"]',
-                    'button:has-text("Submit")',
-                    'button:has-text("Verify")',
-                    'button:has-text("Continue")'
-                ];
-
-                let twoFASubmit = null;
-                for (const selector of buttonSelectors) {
-                    try {
-                        const button = page.locator(selector).first();
-                        const count = await button.count();
-                        if (count > 0) {
-                            twoFASubmit = button;
-                            console.log(`  ✅ Found button: ${selector}`);
-                            break;
-                        }
-                    } catch (e) {
-                        // Try next selector
-                    }
-                }
-
-                if (!twoFASubmit) {
-                    throw new Error('Could not find 2FA submit button');
-                }
-
-                // Wait for button to be enabled (disabled attribute removed)
-                console.log('  → Waiting for button to be clickable...');
-                await twoFASubmit.waitFor({ state: 'visible', timeout: 10000 });
-
-                // Additional wait to ensure button is enabled
-                await humanDelay(500, 1000);
-
-                // Click submit button
-                console.log('  → Clicking Sign In button...');
-                await twoFASubmit.click({ force: false, timeout: 10000 });
-                console.log('  ✅ 2FA code submitted');
-
-                // Wait for 2FA verification
-                console.log('  → Waiting for 2FA verification...');
-                await humanDelay(4000, 6000);
+            // Check for CAPTCHA
+            const homeBlocking = await detectCaptchaOrBlocking(page, 'Manheim home');
+            if (homeBlocking.hasCaptcha || homeBlocking.hasRecaptcha || homeBlocking.hasCloudflare) {
+                const screenshot = await page.screenshot({ fullPage: false });
+                await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
+                throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
             }
 
-            console.log('✅ Login flow completed - session established!');
+            // Check if login page appeared (cookies may be invalid)
+            const isLoginPage = await detectLoginPage(page);
+            if (isLoginPage) {
+                if (!hasCredentials) {
+                    const screenshot = await page.screenshot({ fullPage: false });
+                    await Actor.setValue('login-required-screenshot', screenshot, { contentType: 'image/png' });
+                    throw new Error('Session expired and credentials not provided - cannot proceed');
+                }
+                console.log('  ⚠️ Cookies invalid - falling back to credential login...');
+                await handleLoginFlow(page, credentials, twoFactorWebhookUrl);
+            }
+        } else if (hasCredentials) {
+            // CREDENTIALS PATH: Navigate to MMR tool to trigger OAuth redirect
+            console.log('  → No cookies provided. Navigating to MMR tool to trigger auth flow...');
+            await page.goto('https://mmr.manheim.com/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 90000
+            });
+            await humanDelay(4000, 6000);
+
+            const landedHostname = getHostname(page.url());
+            console.log(`  → Landed on: ${landedHostname} (${page.url().substring(0, 80)}...)`);
+
+            if (landedHostname === 'auth.manheim.com') {
+                // Got redirected to login page - this is expected
+                console.log('  → Auth page detected. Running login flow...');
+                await handleLoginFlow(page, credentials, twoFactorWebhookUrl);
+
+                // After login, wait for redirect back to MMR
+                console.log('  → Waiting for redirect after login...');
+                await page.waitForURL(url => getHostname(url.toString()) !== 'auth.manheim.com', {
+                    timeout: 30000
+                }).catch(() => {});
+                await humanDelay(3000, 5000);
+
+                const postLoginHostname = getHostname(page.url());
+                console.log(`  → Post-login hostname: ${postLoginHostname}`);
+                if (postLoginHostname === 'auth.manheim.com') {
+                    const screenshot = await page.screenshot({ fullPage: false });
+                    await Actor.setValue('login-failed-screenshot', screenshot, { contentType: 'image/png' });
+                    throw new Error('Still on auth page after login - authentication may have failed');
+                }
+                console.log('  ✅ Login successful!');
+            } else if (landedHostname === 'mmr.manheim.com') {
+                console.log('  ✅ Already authenticated (browser profile has valid session)');
+            } else {
+                console.log(`  ⚠️ Unexpected hostname: ${landedHostname}`);
+            }
+        } else {
+            throw new Error('No cookies and no credentials provided - cannot proceed');
         }
 
-        console.log('✅ Manheim homepage loaded successfully');
+        console.log('✅ STEP 1 complete - authentication handled');
 
         // STEP 2: Simulate human activity
         console.log('\n🖱️ STEP 2: Simulating human activity...');
@@ -842,16 +842,16 @@ await Actor.main(async () => {
             console.log('  ✅ MMR button is visible');
 
             // Set up BOTH popup AND navigation listeners (race condition)
+            // Use hostname check to avoid false matches on redirect_uri query params
             const popupPromise = context.waitForEvent('page', {
-                predicate: (p) => p.url().includes('mmr.manheim.com'),
+                predicate: (p) => getHostname(p.url()) === 'mmr.manheim.com',
                 timeout: 10000
             }).catch(() => null);
 
-            const navigationPromise = page.waitForNavigation({
-                url: /mmr\.manheim\.com/,
-                waitUntil: 'domcontentloaded',
-                timeout: 10000
-            }).catch(() => null);
+            const navigationPromise = page.waitForURL(
+                (url) => getHostname(url.toString()) === 'mmr.manheim.com',
+                { waitUntil: 'domcontentloaded', timeout: 10000 }
+            ).catch(() => null);
 
             // Click button with hover first (more human-like)
             await clickTarget.hover();
@@ -908,18 +908,20 @@ await Actor.main(async () => {
         let currentUrl = mmrPage.url();
         console.log(`  → Current URL: ${currentUrl}`);
 
-        if (currentUrl.includes('mmr.manheim.com')) {
+        const currentHostname = getHostname(currentUrl);
+        if (currentHostname === 'mmr.manheim.com') {
             console.log('  ✅ Already on MMR tool - cookies are valid, no login needed!');
-        } else if (currentUrl.includes('auth.manheim.com')) {
+        } else if (currentHostname === 'auth.manheim.com') {
             // We're on auth page - wait a bit for potential auto-redirect
             console.log('  → On auth page, waiting for potential auto-redirect...');
             await humanDelay(3000, 5000);
 
             // Check URL again after waiting
             currentUrl = mmrPage.url();
+            const updatedHostname = getHostname(currentUrl);
             console.log(`  → URL after waiting: ${currentUrl}`);
 
-            if (currentUrl.includes('mmr.manheim.com')) {
+            if (updatedHostname === 'mmr.manheim.com') {
                 console.log('  ✅ Auto-redirected to MMR tool - cookies are valid!');
             } else {
                 // Still on auth page - check if login form is displayed
@@ -945,7 +947,7 @@ await Actor.main(async () => {
                     const urlAfterLogin = mmrPage.url();
                     console.log(`  → Current URL after login: ${urlAfterLogin}`);
 
-                    if (urlAfterLogin.includes('auth.manheim.com')) {
+                    if (getHostname(urlAfterLogin) === 'auth.manheim.com') {
                         throw new Error('Still on auth page after login - authentication may have failed');
                     }
                 } else {
@@ -1021,7 +1023,7 @@ await Actor.main(async () => {
         const finalUrl = page.url();
         console.log(`  → Current URL: ${finalUrl}`);
 
-        if (!finalUrl.includes('mmr.manheim.com')) {
+        if (getHostname(finalUrl) !== 'mmr.manheim.com') {
             console.log('  ⚠️ Not on MMR page - may have been redirected');
         } else {
             console.log('  ✅ On MMR tool page');
@@ -1060,13 +1062,21 @@ await Actor.main(async () => {
 
         // Helper function to check if cookies changed
         const checkCookiesChanged = (currentCookies, inputCookies) => {
+            // If no input cookies were provided (credential-only login),
+            // consider "changed" = we now have essential auth cookies
+            if (!inputCookies || inputCookies.length === 0) {
+                const hasCL = currentCookies.some(c => c.name === '_cl' && c.domain.includes('manheim'));
+                const hasSESSION = currentCookies.some(c => c.name === 'SESSION' && c.domain.includes('manheim'));
+                return hasCL && hasSESSION;
+            }
+
             const inputCL = inputCookies.find(c => c.name === '_cl')?.value;
             const inputSESSION = inputCookies.find(c => c.name === 'SESSION')?.value;
             const inputSig = inputCookies.find(c => c.name === 'session.sig')?.value;
 
-            const currentCL = currentCookies.find(c => c.name === '_cl' && c.domain === '.manheim.com')?.value;
-            const currentSESSION = currentCookies.find(c => c.name === 'SESSION' && c.domain === '.manheim.com')?.value;
-            const currentSig = currentCookies.find(c => c.name === 'session.sig' && c.domain === 'mcom-header-footer.manheim.com')?.value;
+            const currentCL = currentCookies.find(c => c.name === '_cl' && c.domain.includes('manheim'))?.value;
+            const currentSESSION = currentCookies.find(c => c.name === 'SESSION' && c.domain.includes('manheim'))?.value;
+            const currentSig = currentCookies.find(c => c.name === 'session.sig' && c.domain.includes('manheim'))?.value;
 
             return (
                 currentCL !== inputCL ||
@@ -1180,70 +1190,65 @@ await Actor.main(async () => {
 
         if (missingRequired.length > 0) {
             console.error(`\n❌ Failed to extract required cookies. Missing: ${missingRequired.join(', ')}`);
-
-            // Save all cookies for debugging
             await Actor.setValue('all-cookies-debug', allCookies);
-            console.log('  → All cookies saved to key-value store for debugging');
-
             throw new Error(`Missing required cookies: ${missingRequired.join(', ')}`);
         }
 
-        // OPTION 2: If session/session.sig missing, try direct request to mcom-header-footer
+        // Try to get session/session.sig from mcom-header-footer iframe
+        let isPartial = false;
         if (missingOptional.length > 0) {
-            console.log(`\n⚠️ Cookies missing: ${missingOptional.join(', ')}`);
-            console.log('🔄 OPTION 2 (Fallback): Attempting direct request to mcom-header-footer.manheim.com...');
+            console.log(`\n⚠️ Optional cookies missing: ${missingOptional.join(', ')}`);
+            console.log('🔄 Attempting to load mcom-header-footer iframe via www.manheim.com...');
 
             try {
-                // Navigate to main Manheim homepage
-                console.log('  → Navigating to https://www.manheim.com/...');
                 await page.goto('https://www.manheim.com/', {
                     waitUntil: 'networkidle',
                     timeout: 30000
                 });
                 console.log('  ✅ Homepage loaded');
 
-                // Wait for all components to load
-                console.log('  → Waiting for header/footer component to load...');
-                await humanDelay(5000, 7000);
+                // Wait specifically for the mcom-header-footer iframe
+                console.log('  → Waiting for mcom-header-footer iframe...');
+                try {
+                    await page.waitForSelector('iframe[src*="mcom-header-footer"]', { timeout: 10000 });
+                    console.log('  ✅ Found mcom-header-footer iframe');
+                } catch {
+                    console.log('  ⚠️ mcom-header-footer iframe not found in DOM');
+                }
 
-                // Check for mcom-header-footer requests in network
-                console.log('  → Checking if mcom-header-footer component loaded...');
+                // Retry loop: poll for cookies up to 3 times
+                for (let retry = 0; retry < 3 && missingOptional.length > 0; retry++) {
+                    console.log(`  → Cookie check attempt ${retry + 1}/3...`);
+                    await humanDelay(2000, 3000);
 
-                // Re-extract cookies
-                console.log('  → Re-extracting cookies...');
-                const updatedCookies = await context.cookies();
-
-                // Check for session cookies again
-                updatedCookies.forEach(cookie => {
-                    if ((cookie.name === 'session' || cookie.name === 'session.sig') &&
-                        cookie.domain.includes('manheim') &&
-                        !essentialCookies[cookie.name]) {
-                        essentialCookies[cookie.name] = cookie;
-                        console.log(`  ✅ Found after fallback: ${cookie.name} (${cookie.domain})`);
-                        const index = missingOptional.indexOf(cookie.name);
-                        if (index > -1) missingOptional.splice(index, 1);
-                    }
-                });
-
-                if (missingOptional.length > 0) {
-                    console.log(`  ⚠️ Still missing after fallback: ${missingOptional.join(', ')}`);
-                    console.log('  ❌ These cookies may not be available in automated flow');
-
-                    // Save all cookies for debugging
-                    await Actor.setValue('all-cookies-debug-after-fallback', updatedCookies);
-                    console.log('  → All cookies saved to key-value store for debugging');
-
-                    throw new Error(`Missing required cookies: ${missingOptional.join(', ')} - Could not extract after multiple attempts`);
-                } else {
-                    console.log('  ✅ All cookies found after fallback!');
+                    const retryCookies = await context.cookies();
+                    retryCookies.forEach(cookie => {
+                        if ((cookie.name === 'session' || cookie.name === 'session.sig') &&
+                            cookie.domain.includes('manheim') &&
+                            !essentialCookies[cookie.name]) {
+                            essentialCookies[cookie.name] = cookie;
+                            console.log(`  ✅ Found on attempt ${retry + 1}: ${cookie.name} (${cookie.domain})`);
+                            const index = missingOptional.indexOf(cookie.name);
+                            if (index > -1) missingOptional.splice(index, 1);
+                        }
+                    });
                 }
             } catch (error) {
-                console.error(`  ❌ Fallback failed: ${error.message}`);
-                throw new Error(`Missing required cookies: ${missingOptional.join(', ')} - Fallback also failed`);
+                console.log(`  ⚠️ Fallback navigation failed: ${error.message}`);
+            }
+
+            // If STILL missing, mark as partial but DO NOT fail
+            if (missingOptional.length > 0) {
+                console.log(`  ⚠️ Still missing after retries: ${missingOptional.join(', ')}`);
+                console.log('  → Will send partial cookie set with warning flag');
+                isPartial = true;
+                await Actor.setValue('all-cookies-debug', await context.cookies());
+            } else {
+                console.log('  ✅ All optional cookies found after fallback!');
             }
         }
 
-        console.log('\n✅ All 4 essential cookies extracted successfully!');
+        console.log(`\n✅ Essential cookies extracted: ${isPartial ? '2/4 (PARTIAL)' : '4/4'}`);
 
         // STEP 7: Prepare webhook payload
         console.log('\n📤 STEP 7: Preparing webhook payload...');
@@ -1258,6 +1263,8 @@ await Actor.main(async () => {
 
         const webhookPayload = {
             success: true,
+            partial: isPartial,
+            missingCookies: isPartial ? missingOptional : undefined,
             timestamp: new Date().toISOString(),
             cookies: cookieArray,
             cookieDetails: {
@@ -1285,7 +1292,7 @@ await Actor.main(async () => {
         };
 
         console.log('  → Payload prepared');
-        console.log('  → Cookie count: 4');
+        console.log(`  → Cookie count: ${cookieArray.length}/4${isPartial ? ' (PARTIAL)' : ''}`);
         console.log('  → Timestamp:', webhookPayload.timestamp);
 
         // STEP 8: Send to webhook
@@ -1321,7 +1328,7 @@ await Actor.main(async () => {
         console.log('✅ COOKIE REFRESH COMPLETED SUCCESSFULLY');
         console.log('='.repeat(60));
         console.log('📊 Summary:');
-        console.log('  • Cookies extracted: 4/4');
+        console.log(`  • Cookies extracted: ${cookieArray.length}/4${isPartial ? ' (PARTIAL)' : ''}`);
         console.log('  • Webhook delivery: ✅ Success');
         console.log('  • Backup saved: ✅ Yes');
         console.log('  • Timestamp:', webhookPayload.timestamp);
@@ -1352,7 +1359,12 @@ await Actor.main(async () => {
 
         throw error;
     } finally {
+        // Close browser FIRST so profile files are flushed to disk
         await context.close();
-        console.log('🍪 Cookie refresher completed! Browser profile saved to ./manheim_browser_profile');
+
+        // Save browser profile to KV store for next run
+        await saveBrowserProfile();
+
+        console.log('🍪 Cookie refresher completed! Browser profile persisted to KV store.');
     }
 });
