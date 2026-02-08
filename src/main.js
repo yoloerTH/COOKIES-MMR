@@ -14,6 +14,7 @@ chromium.use(StealthPlugin());
 
 const PROFILE_DIR = './manheim_browser_profile';
 const PROFILE_KV_KEY = 'browser-profile';
+const PROFILE_KV_STORE_NAME = 'mmr-cookies';
 const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
 
 // Directories to exclude when saving (large/unnecessary cache files)
@@ -28,7 +29,8 @@ async function restoreBrowserProfile() {
     console.log('\n💾 Checking for saved browser profile in KV store...');
 
     try {
-        const profileData = await Actor.getValue(PROFILE_KV_KEY);
+        const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+        const profileData = await store.getValue(PROFILE_KV_KEY);
 
         if (!profileData) {
             console.log('  → No saved profile found - starting fresh');
@@ -79,7 +81,8 @@ async function saveBrowserProfile() {
         console.log(`  → Profile size: ${sizeMB} MB`);
 
         // Save to KV store (binary data, application/octet-stream)
-        await Actor.setValue(PROFILE_KV_KEY, tarData, { contentType: 'application/octet-stream' });
+        const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+        await store.setValue(PROFILE_KV_KEY, tarData, { contentType: 'application/octet-stream' });
 
         // Clean up tarball
         fs.unlinkSync(PROFILE_TAR);
