@@ -8,9 +8,9 @@ import path from 'path';
 // Add stealth plugin
 chromium.use(StealthPlugin());
 
-// ============================================
+// ===========================================
 // BROWSER PROFILE PERSISTENCE
-// ============================================
+// ===========================================
 
 const PROFILE_DIR = './manheim_browser_profile';
 const PROFILE_KV_KEY = 'browser-profile';
