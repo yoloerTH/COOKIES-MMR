@@ -14,6 +14,7 @@ chromium.use(StealthPlugin());
 
 const PROFILE_DIR = './manheim_browser_profile';
 const PROFILE_KV_KEY = 'browser-profile';
+const COOKIES_KV_KEY = 'saved-cookies';
 const PROFILE_KV_STORE_NAME = 'mmr-cookies';
 const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
 
@@ -91,6 +92,42 @@ async function saveBrowserProfile() {
         return true;
     } catch (error) {
         console.log(`  ⚠️ Failed to save profile: ${error.message}`);
+        return false;
+    }
+}
+
+// ============================================
+// COOKIE PERSISTENCE (KV Store)
+// ============================================
+
+async function restoreSavedCookies() {
+    console.log('\n🍪 Checking for saved cookies in KV store...');
+    try {
+        const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+        const savedCookies = await store.getValue(COOKIES_KV_KEY);
+
+        if (!savedCookies || !Array.isArray(savedCookies) || savedCookies.length === 0) {
+            console.log('  → No saved cookies found');
+            return null;
+        }
+
+        console.log(`  ✅ Found ${savedCookies.length} saved cookies from previous run`);
+        return savedCookies;
+    } catch (error) {
+        console.log(`  ⚠️ Failed to restore cookies: ${error.message}`);
+        return null;
+    }
+}
+
+async function saveCookiesToKV(cookieArray) {
+    console.log('\n💾 Saving cookies to KV store for next run...');
+    try {
+        const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+        await store.setValue(COOKIES_KV_KEY, cookieArray);
+        console.log(`  ✅ Saved ${cookieArray.length} cookies to KV store`);
+        return true;
+    } catch (error) {
+        console.log(`  ⚠️ Failed to save cookies: ${error.message}`);
         return false;
     }
 }
@@ -694,17 +731,25 @@ await Actor.main(async () => {
         console.log(`\n🍪 Found ${existingCookies.length} existing cookies in browser profile`);
     }
 
-    // Inject fresh cookies if provided (overwrites existing)
+    // Inject cookies: input cookies > KV store cookies > profile cookies > credential login
     if (manheimCookies && manheimCookies.length > 0) {
         console.log('\n🍪 Injecting fresh cookies from input...');
         await context.addCookies(manheimCookies);
-        console.log(`  ✅ Injected ${manheimCookies.length} cookies (merged with profile)`);
-    } else if (!hasExistingCookies && !credentials) {
-        throw new Error('❌ No cookies in profile and no credentials provided - cannot proceed');
-    } else if (!hasExistingCookies) {
-        console.log('\n⚠️ No cookies in profile - will use credential login');
+        console.log(`  ✅ Injected ${manheimCookies.length} cookies from input`);
     } else {
-        console.log('\n✅ Using existing cookies from browser profile');
+        // Try to restore cookies from KV store (saved from last successful run)
+        const savedCookies = await restoreSavedCookies();
+        if (savedCookies && savedCookies.length > 0) {
+            console.log('\n🍪 Injecting saved cookies from KV store (last successful run)...');
+            await context.addCookies(savedCookies);
+            console.log(`  ✅ Injected ${savedCookies.length} cookies from KV store`);
+        } else if (!hasExistingCookies && !credentials) {
+            throw new Error('❌ No cookies (input/KV store/profile) and no credentials - cannot proceed');
+        } else if (!hasExistingCookies) {
+            console.log('\n⚠️ No cookies anywhere - will use credential login');
+        } else {
+            console.log('\n✅ Using existing cookies from browser profile');
+        }
     }
 
     const page = context.pages()[0] || await context.newPage();
@@ -1298,6 +1343,15 @@ await Actor.main(async () => {
         }
 
         console.log(`\n✅ Essential cookies extracted: ${isPartial ? '2/4 (PARTIAL)' : '4/4'}`);
+
+        // Save fresh cookies to KV store for next run
+        const cookiesToSave = [
+            essentialCookies['_cl'],
+            essentialCookies['SESSION'],
+            essentialCookies['session'],
+            essentialCookies['session.sig']
+        ].filter(c => c !== null);
+        await saveCookiesToKV(cookiesToSave);
 
         // STEP 7: Prepare webhook payload
         console.log('\n📤 STEP 7: Preparing webhook payload...');
