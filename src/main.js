@@ -732,10 +732,13 @@ await Actor.main(async () => {
     }
 
     // Inject cookies: input cookies > KV store cookies > profile cookies > credential login
+    let hasCookiesInjected = false;
+
     if (manheimCookies && manheimCookies.length > 0) {
         console.log('\n🍪 Injecting fresh cookies from input...');
         await context.addCookies(manheimCookies);
         console.log(`  ✅ Injected ${manheimCookies.length} cookies from input`);
+        hasCookiesInjected = true;
     } else {
         // Try to restore cookies from KV store (saved from last successful run)
         const savedCookies = await restoreSavedCookies();
@@ -743,12 +746,14 @@ await Actor.main(async () => {
             console.log('\n🍪 Injecting saved cookies from KV store (last successful run)...');
             await context.addCookies(savedCookies);
             console.log(`  ✅ Injected ${savedCookies.length} cookies from KV store`);
+            hasCookiesInjected = true;
         } else if (!hasExistingCookies && !credentials) {
             throw new Error('❌ No cookies (input/KV store/profile) and no credentials - cannot proceed');
         } else if (!hasExistingCookies) {
             console.log('\n⚠️ No cookies anywhere - will use credential login');
         } else {
             console.log('\n✅ Using existing cookies from browser profile');
+            hasCookiesInjected = true;
         }
     }
 
@@ -758,37 +763,53 @@ await Actor.main(async () => {
         // STEP 1: Authenticate (cookies warm-up OR credential login)
         console.log('\n🌐 STEP 1: Checking authentication status...');
 
-        const hasInputCookies = manheimCookies && manheimCookies.length > 0;
         const hasCredentials = credentials && credentials.username && credentials.password;
 
-        if (hasInputCookies) {
-            // COOKIES PATH: Visit site.manheim.com to warm up injected cookies
-            console.log('  → Warming up injected cookies via site.manheim.com...');
-            await page.goto('https://site.manheim.com/', {
+        if (hasCookiesInjected) {
+            // COOKIES PATH: Test if injected cookies are still valid by navigating to MMR
+            console.log('  → Testing injected cookies by navigating to mmr.manheim.com...');
+            await page.goto('https://mmr.manheim.com/', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
-            console.log('  ✅ Page loaded');
-            await humanDelay(4000, 6000);
+            await humanDelay(3000, 5000);
 
-            // Check for CAPTCHA
-            const homeBlocking = await detectCaptchaOrBlocking(page, 'Manheim home');
-            if (homeBlocking.hasCaptcha || homeBlocking.hasRecaptcha || homeBlocking.hasCloudflare) {
-                const screenshot = await page.screenshot({ fullPage: false });
-                await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
-                throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
-            }
+            const testHostname = getHostname(page.url());
+            console.log(`  → Landed on: ${testHostname} (${page.url().substring(0, 80)}...)`);
 
-            // Check if login page appeared (cookies may be invalid)
-            const isLoginPage = await detectLoginPage(page);
-            if (isLoginPage) {
+            if (testHostname === 'mmr.manheim.com') {
+                // Cookies are valid! Session is still active
+                console.log('  ✅ Cookies are VALID - session still active, no login needed!');
+            } else if (testHostname === 'auth.manheim.com') {
+                // Cookies expired - need to login
+                console.log('  ⚠️ Cookies EXPIRED - redirected to auth page');
+
                 if (!hasCredentials) {
                     const screenshot = await page.screenshot({ fullPage: false });
                     await Actor.setValue('login-required-screenshot', screenshot, { contentType: 'image/png' });
                     throw new Error('Session expired and credentials not provided - cannot proceed');
                 }
-                console.log('  ⚠️ Cookies invalid - falling back to credential login...');
+
+                console.log('  → Falling back to credential login...');
                 await handleLoginFlow(page, credentials, twoFactorWebhookUrl);
+
+                // Wait for redirect back from auth
+                console.log('  → Waiting for redirect after login...');
+                await page.waitForURL(url => getHostname(url.toString()) !== 'auth.manheim.com', {
+                    timeout: 30000
+                }).catch(() => {});
+                await humanDelay(3000, 5000);
+                const postLoginHost = getHostname(page.url());
+                console.log(`  → Post-login hostname: ${postLoginHost}`);
+            } else {
+                // Unexpected page - check for CAPTCHA
+                console.log(`  ⚠️ Unexpected page: ${testHostname}`);
+                const blocking = await detectCaptchaOrBlocking(page, 'cookie test');
+                if (blocking.hasCaptcha || blocking.hasRecaptcha || blocking.hasCloudflare) {
+                    const screenshot = await page.screenshot({ fullPage: false });
+                    await Actor.setValue('captcha-detected-screenshot', screenshot, { contentType: 'image/png' });
+                    throw new Error('CAPTCHA challenge detected - cannot proceed automatically');
+                }
             }
         } else if (hasCredentials) {
             // CREDENTIALS PATH: Navigate to MMR tool to trigger OAuth redirect
@@ -1464,6 +1485,9 @@ await Actor.main(async () => {
     } finally {
         // Close browser FIRST so profile files are flushed to disk
         await context.close();
+
+        // Small delay to ensure all profile files are fully written
+        await new Promise(r => setTimeout(r, 2000));
 
         // Save browser profile to KV store for next run
         await saveBrowserProfile();
