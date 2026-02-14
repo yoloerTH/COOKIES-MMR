@@ -112,7 +112,26 @@ async function restoreSavedCookies() {
         }
 
         console.log(`  ✅ Found ${savedCookies.length} saved cookies from previous run`);
-        return savedCookies;
+
+        // Fix expired cookies: if a cookie has a past expiry timestamp,
+        // convert it to a session cookie (remove expires) so Playwright accepts it.
+        // This mimics a browser that stayed open (session cookies don't expire until close).
+        const now = Date.now() / 1000;
+        let fixedCount = 0;
+        const fixedCookies = savedCookies.map(cookie => {
+            if (cookie.expires && cookie.expires > 0 && cookie.expires < now) {
+                fixedCount++;
+                const { expires, ...rest } = cookie;
+                return { ...rest, expires: -1 };
+            }
+            return cookie;
+        });
+
+        if (fixedCount > 0) {
+            console.log(`  → Fixed ${fixedCount} expired cookies (converted to session cookies)`);
+        }
+
+        return fixedCookies;
     } catch (error) {
         console.log(`  ⚠️ Failed to restore cookies: ${error.message}`);
         return null;
@@ -799,8 +818,21 @@ await Actor.main(async () => {
         const hasCredentials = credentials && credentials.username && credentials.password;
 
         if (hasCookiesInjected) {
+            // Verify cookies are actually in the browser after injection
+            const verifyUrls = ['https://mmr.manheim.com', 'https://mcom-header-footer.manheim.com'];
+            const verifyCookies = await context.cookies(verifyUrls);
+            const verifyEssential = verifyCookies.filter(c =>
+                ['_cl', 'SESSION', 'session', 'session.sig'].includes(c.name)
+            );
+            console.log(`\n🔍 Cookie verification after injection:`);
+            console.log(`  → Total cookies in browser: ${verifyCookies.length}`);
+            console.log(`  → Essential cookies found: ${verifyEssential.length}/4`);
+            verifyEssential.forEach(c => {
+                console.log(`     • ${c.name.padEnd(15)} → ${c.domain.padEnd(35)} expires: ${c.expires === -1 ? 'session' : new Date(c.expires * 1000).toISOString()}`);
+            });
+
             // COOKIES PATH: Test if injected cookies are still valid by navigating to MMR
-            console.log('  → Testing injected cookies by navigating to mmr.manheim.com...');
+            console.log('\n  → Testing injected cookies by navigating to mmr.manheim.com...');
             await page.goto('https://mmr.manheim.com/', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
