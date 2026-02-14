@@ -491,6 +491,39 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
         await page.fill(twoFAInput, twoFACode);
         console.log('  ✅ Code entered');
 
+        // Check for "Don't ask again" / "Trust this device" checkbox
+        console.log('  → Looking for "trust this device" checkbox...');
+        const trustSelectors = [
+            'input#otp-remember',
+            'input[name="otp-remember"]',
+            'input#rememberDevice',
+            'input[name="rememberDevice"]',
+            'label:has-text("Don\'t ask")',
+            'label:has-text("Remember this")',
+            'label:has-text("Trust this")',
+            '.ping-checkbox-container:has-text("Don\'t ask")',
+            '.ping-checkbox-container:has-text("Remember")',
+            '.ping-checkbox-container:has-text("Trust")'
+        ];
+
+        let trustChecked = false;
+        for (const selector of trustSelectors) {
+            try {
+                const el = page.locator(selector).first();
+                if (await el.count() > 0 && await el.isVisible()) {
+                    await el.click();
+                    trustChecked = true;
+                    console.log(`  ✅ Checked "trust this device" (${selector})`);
+                    break;
+                }
+            } catch (e) {
+                // Try next selector
+            }
+        }
+        if (!trustChecked) {
+            console.log('  → No "trust this device" checkbox found (may not be available)');
+        }
+
         // Wait for button to become enabled (checkInput() function needs to run)
         console.log('  → Waiting for Sign In button to become enabled...');
         await humanDelay(1000, 2000);
@@ -1365,14 +1398,12 @@ await Actor.main(async () => {
 
         console.log(`\n✅ Essential cookies extracted: ${isPartial ? '2/4 (PARTIAL)' : '4/4'}`);
 
-        // Save fresh cookies to KV store for next run
-        const cookiesToSave = [
-            essentialCookies['_cl'],
-            essentialCookies['SESSION'],
-            essentialCookies['session'],
-            essentialCookies['session.sig']
-        ].filter(c => c !== null);
-        await saveCookiesToKV(cookiesToSave);
+        // Save ALL manheim cookies to KV store for next run
+        // (includes auth trust cookies like PF.PERSISTENT, pingone.risk.browser.profile
+        //  which help skip 2FA on re-login)
+        const allManheimCookies = allCookies.filter(c => c.domain.includes('manheim'));
+        console.log(`  → Saving ${allManheimCookies.length} manheim cookies to KV store (includes auth trust cookies)`);
+        await saveCookiesToKV(allManheimCookies);
 
         // STEP 7: Prepare webhook payload
         console.log('\n📤 STEP 7: Preparing webhook payload...');
