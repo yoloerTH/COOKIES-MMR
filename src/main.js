@@ -360,39 +360,35 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
     try {
         console.log('  → Checking "Remember my username"...');
 
-        // Try clicking the label (works for custom-styled checkboxes)
-        const labelSelectors = [
-            'label.remember-username',
-            'label:has-text("Remember my username")',
-            '.ping-checkbox-container:has-text("Remember my username")'
-        ];
+        const checkbox = page.locator('input#rememberUsername');
+        if (await checkbox.count() > 0) {
+            // Check current state first
+            const alreadyChecked = await checkbox.isChecked();
+            console.log(`  → Checkbox current state: ${alreadyChecked ? 'CHECKED' : 'UNCHECKED'}`);
 
-        let clicked = false;
-        for (const selector of labelSelectors) {
-            try {
-                const label = page.locator(selector).first();
-                const count = await label.count();
-                if (count > 0) {
-                    await label.click({ timeout: 3000 });
-                    console.log(`  ✅ Remember username checked (clicked ${selector})`);
-                    clicked = true;
-                    break;
-                }
-            } catch (e) {
-                // Try next selector
+            if (!alreadyChecked) {
+                // Use Playwright's .check() which ensures the checkbox ends up checked
+                await checkbox.check({ force: true, timeout: 3000 });
             }
-        }
 
-        // Fallback: try checking the input directly with force
-        if (!clicked) {
-            const checkbox = page.locator('input#rememberUsername, input[name="pf.rememberUsername"]').first();
-            await checkbox.check({ timeout: 3000, force: true });
-            console.log('  ✅ Remember username checked (forced)');
+            // Verify it's actually checked
+            const isNowChecked = await checkbox.isChecked();
+            console.log(`  → Checkbox after action: ${isNowChecked ? '✅ CHECKED' : '❌ STILL UNCHECKED'}`);
+
+            if (!isNowChecked) {
+                // Fallback: click the container div
+                console.log('  → Fallback: clicking container div...');
+                await page.locator('.ping-checkbox-container:has-text("Remember")').first().click({ timeout: 3000 });
+                const finalState = await checkbox.isChecked();
+                console.log(`  → Checkbox final state: ${finalState ? '✅ CHECKED' : '❌ STILL UNCHECKED'}`);
+            }
+        } else {
+            console.log('  → Remember username checkbox not found on page');
         }
 
         await humanDelay(500, 1000);
     } catch (e) {
-        console.log('  → Remember username checkbox not found or not clickable (skipping)');
+        console.log('  → Remember username checkbox error (skipping)');
         console.log(`  → Error: ${e.message}`);
     }
 
