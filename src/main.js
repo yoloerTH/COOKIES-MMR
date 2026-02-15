@@ -15,8 +15,21 @@ chromium.use(StealthPlugin());
 const PROFILE_DIR = './manheim_browser_profile';
 const PROFILE_KV_KEY = 'browser-profile';
 const COOKIES_KV_KEY = 'saved-cookies';
+const FINGERPRINT_KV_KEY = 'browser-fingerprint';
 const PROFILE_KV_STORE_NAME = 'mmr-cookies';
 const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
+
+// Stable browser fingerprint — must stay consistent across runs so
+// PingFederate's device recognition sees the same "device" every time.
+const DEFAULT_FINGERPRINT = {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    viewport: { width: 1920, height: 1080 },
+    screen: { width: 1920, height: 1080 },
+    locale: 'en-CA',
+    timezoneId: 'America/Edmonton',
+    platform: 'Win32',
+    deviceScaleFactor: 1,
+};
 
 // Directories to exclude when saving (large/unnecessary cache files)
 const EXCLUDE_DIRS = [
@@ -148,6 +161,36 @@ async function saveCookiesToKV(cookieArray) {
     } catch (error) {
         console.log(`  ⚠️ Failed to save cookies: ${error.message}`);
         return false;
+    }
+}
+
+// ============================================
+// BROWSER FINGERPRINT PERSISTENCE
+// ============================================
+
+async function getStableFingerprint() {
+    console.log('\n🖥️ Loading stable browser fingerprint...');
+    try {
+        const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+        const saved = await store.getValue(FINGERPRINT_KV_KEY);
+
+        if (saved) {
+            console.log('  ✅ Loaded fingerprint from KV store (consistent with previous runs)');
+            console.log(`  → User-Agent: ${saved.userAgent.substring(saved.userAgent.indexOf('Chrome'))}`);
+            console.log(`  → Viewport: ${saved.viewport.width}x${saved.viewport.height}`);
+            console.log(`  → Locale: ${saved.locale} | TZ: ${saved.timezoneId}`);
+            return saved;
+        }
+
+        // First run — save the default fingerprint
+        console.log('  → No saved fingerprint — creating and saving default');
+        await store.setValue(FINGERPRINT_KV_KEY, DEFAULT_FINGERPRINT);
+        console.log(`  ✅ Fingerprint saved to KV store`);
+        console.log(`  → User-Agent: ${DEFAULT_FINGERPRINT.userAgent.substring(DEFAULT_FINGERPRINT.userAgent.indexOf('Chrome'))}`);
+        return DEFAULT_FINGERPRINT;
+    } catch (error) {
+        console.log(`  ⚠️ Failed to load fingerprint: ${error.message} — using default`);
+        return DEFAULT_FINGERPRINT;
     }
 }
 
@@ -685,6 +728,7 @@ await Actor.main(async () => {
         credentials = null,
         twoFactorWebhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/mmr2facode',
         cookieWebhookUrl = 'https://n8nsaved-production.up.railway.app/webhook/mmrcookies',
+        staticProxyUrl = null, // e.g. "http://user:pass@proxy.example.com:port" for a sticky residential proxy
         proxyConfiguration = {
             useApifyProxy: false
         }
@@ -726,17 +770,32 @@ await Actor.main(async () => {
 
     // Setup proxy configuration
     let proxyUrl = null;
-    if (proxyConfiguration && proxyConfiguration.useApifyProxy) {
-        const proxyConfig = await Actor.createProxyConfiguration(proxyConfiguration);
+    if (staticProxyUrl) {
+        // Static/sticky residential proxy — same IP every run (RECOMMENDED)
+        proxyUrl = staticProxyUrl;
+        console.log('\n🌍 Proxy Configuration (Static):');
+        console.log(`  ✅ Static proxy: ${staticProxyUrl.replace(/:[^:@]+@/, ':***@')}`); // hide password
+    } else if (proxyConfiguration && proxyConfiguration.useApifyProxy) {
+        const proxyConfig = await Actor.createProxyConfiguration({
+            ...proxyConfiguration,
+            // If no session ID provided, use a fixed one for IP stickiness
+            ...(proxyConfiguration.apifyProxySessionId ? {} : { apifyProxySessionId: 'manheim-sticky-1' })
+        });
         proxyUrl = await proxyConfig.newUrl();
 
-        console.log('\n🌍 Proxy Configuration:');
-        console.log(`  ✅ Country: ${proxyConfiguration.apifyProxyCountry}`);
-        console.log(`  ✅ Groups: ${proxyConfiguration.apifyProxyGroups.join(', ')}`);
+        const sessionId = proxyConfiguration.apifyProxySessionId || 'manheim-sticky-1';
+        console.log('\n🌍 Proxy Configuration (Apify):');
+        console.log(`  ✅ Country: ${proxyConfiguration.apifyProxyCountry || 'auto'}`);
+        console.log(`  ✅ Groups: ${(proxyConfiguration.apifyProxyGroups || []).join(', ') || 'auto'}`);
+        console.log(`  ✅ Session ID: ${sessionId} (sticky IP)`);
         console.log(`  ✅ Proxy URL: ${proxyUrl.substring(0, 50)}...`);
     } else {
         console.log('\n🌍 No proxy - using direct connection');
+        console.log('  ⚠️ WARNING: Datacenter IP changes every run — may trigger 2FA. Consider using Apify residential proxy.');
     }
+
+    // Load stable browser fingerprint (consistent across all runs)
+    const fingerprint = await getStableFingerprint();
 
     // Restore browser profile from KV store (if available from previous run)
     const profileRestored = await restoreBrowserProfile();
@@ -746,14 +805,18 @@ await Actor.main(async () => {
     console.log(`  → Profile: ${PROFILE_DIR} (${profileRestored ? 'restored from KV store' : 'fresh'})`);
 
     const contextOptions = {
-        viewport: { width: 1920, height: 1080 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        locale: 'en-CA', // Canadian locale
-        timezoneId: 'America/Edmonton', // Alberta, Canada timezone (Mountain Time)
+        viewport: fingerprint.viewport,
+        screen: fingerprint.screen,
+        userAgent: fingerprint.userAgent,
+        locale: fingerprint.locale,
+        timezoneId: fingerprint.timezoneId,
+        deviceScaleFactor: fingerprint.deviceScaleFactor,
         args: [
             '--disable-blink-features=AutomationControlled',
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-web-security',
+            `--window-size=${fingerprint.screen.width},${fingerprint.screen.height}`,
+            '--lang=en-CA',
         ],
     };
 
