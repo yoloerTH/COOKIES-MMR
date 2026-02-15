@@ -776,14 +776,14 @@ await Actor.main(async () => {
         console.log('\n🌍 Proxy Configuration (Static):');
         console.log(`  ✅ Static proxy: ${staticProxyUrl.replace(/:[^:@]+@/, ':***@')}`); // hide password
     } else if (proxyConfiguration && proxyConfiguration.useApifyProxy) {
-        const proxyConfig = await Actor.createProxyConfiguration({
-            ...proxyConfiguration,
-            // If no session ID provided, use a fixed one for IP stickiness
-            ...(proxyConfiguration.apifyProxySessionId ? {} : { apifyProxySessionId: 'manheim-sticky-1' })
-        });
-        proxyUrl = await proxyConfig.newUrl();
+        // Extract session ID before passing to SDK (SDK doesn't accept it in the config object)
+        const { apifyProxySessionId, ...proxyConfigClean } = proxyConfiguration;
+        const sessionId = apifyProxySessionId || 'manheim-sticky-1';
 
-        const sessionId = proxyConfiguration.apifyProxySessionId || 'manheim-sticky-1';
+        const proxyConfig = await Actor.createProxyConfiguration(proxyConfigClean);
+        // Pass session ID to newUrl() — this pins us to a consistent IP
+        proxyUrl = await proxyConfig.newUrl(sessionId);
+
         console.log('\n🌍 Proxy Configuration (Apify):');
         console.log(`  ✅ Country: ${proxyConfiguration.apifyProxyCountry || 'auto'}`);
         console.log(`  ✅ Groups: ${(proxyConfiguration.apifyProxyGroups || []).join(', ') || 'auto'}`);
