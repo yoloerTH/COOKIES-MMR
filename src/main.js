@@ -778,7 +778,7 @@ await Actor.main(async () => {
     } else if (proxyConfiguration && proxyConfiguration.useApifyProxy) {
         // Extract session ID before passing to SDK (SDK doesn't accept it in the config object)
         const { apifyProxySessionId, ...proxyConfigClean } = proxyConfiguration;
-        const sessionId = apifyProxySessionId || 'manheim-sticky-1';
+        const sessionId = apifyProxySessionId || 'manheim_sticky_1';
 
         const proxyConfig = await Actor.createProxyConfiguration(proxyConfigClean);
         // Pass session ID to newUrl() — this pins us to a consistent IP
@@ -843,21 +843,36 @@ await Actor.main(async () => {
     }
 
     // Inject cookies: input cookies > KV store cookies > profile cookies > credential login
+    // IMPORTANT: Only inject the 4 essential cookies for session testing.
+    // Injecting stale analytics/auth cookies can confuse the server.
+    // Auth trust cookies (PF.PERSISTENT.2 etc.) are saved separately for 2FA skip.
+    const ESSENTIAL_NAMES = ['_cl', 'SESSION', 'session', 'session.sig'];
     let hasCookiesInjected = false;
+    let authTrustCookies = []; // saved for later if we need to login
 
     if (manheimCookies && manheimCookies.length > 0) {
-        console.log('\n🍪 Injecting fresh cookies from input...');
-        await context.addCookies(manheimCookies);
-        console.log(`  ✅ Injected ${manheimCookies.length} cookies from input`);
+        const essentialOnly = manheimCookies.filter(c => ESSENTIAL_NAMES.includes(c.name));
+        console.log(`\n🍪 Injecting ${essentialOnly.length} essential cookies from input (out of ${manheimCookies.length} total)...`);
+        await context.addCookies(essentialOnly);
+        console.log(`  ✅ Injected: ${essentialOnly.map(c => c.name).join(', ')}`);
         hasCookiesInjected = true;
     } else {
         // Try to restore cookies from KV store (saved from last successful run)
         const savedCookies = await restoreSavedCookies();
         if (savedCookies && savedCookies.length > 0) {
-            console.log('\n🍪 Injecting saved cookies from KV store (last successful run)...');
-            await context.addCookies(savedCookies);
-            console.log(`  ✅ Injected ${savedCookies.length} cookies from KV store`);
-            hasCookiesInjected = true;
+            // Split: essential cookies for session, auth cookies for 2FA skip
+            const essentialOnly = savedCookies.filter(c => ESSENTIAL_NAMES.includes(c.name));
+            authTrustCookies = savedCookies.filter(c =>
+                c.domain && c.domain.includes('auth.manheim.com')
+            );
+
+            console.log(`\n🍪 Injecting ${essentialOnly.length} essential cookies from KV store (out of ${savedCookies.length} total)...`);
+            if (authTrustCookies.length > 0) {
+                console.log(`  → Holding ${authTrustCookies.length} auth trust cookies for login fallback`);
+            }
+            await context.addCookies(essentialOnly);
+            console.log(`  ✅ Injected: ${essentialOnly.map(c => c.name).join(', ')}`);
+            hasCookiesInjected = essentialOnly.length > 0;
         } else if (!hasExistingCookies && !credentials) {
             throw new Error('❌ No cookies (input/KV store/profile) and no credentials - cannot proceed');
         } else if (!hasExistingCookies) {
@@ -881,7 +896,7 @@ await Actor.main(async () => {
             const verifyUrls = ['https://mmr.manheim.com', 'https://mcom-header-footer.manheim.com'];
             const verifyCookies = await context.cookies(verifyUrls);
             const verifyEssential = verifyCookies.filter(c =>
-                ['_cl', 'SESSION', 'session', 'session.sig'].includes(c.name)
+                ESSENTIAL_NAMES.includes(c.name)
             );
             console.log(`\n🔍 Cookie verification after injection:`);
             console.log(`  → Total cookies in browser: ${verifyCookies.length}`);
@@ -890,8 +905,19 @@ await Actor.main(async () => {
                 console.log(`     • ${c.name.padEnd(15)} → ${c.domain.padEnd(35)} expires: ${c.expires === -1 ? 'session' : new Date(c.expires * 1000).toISOString()}`);
             });
 
-            // COOKIES PATH: Test if injected cookies are still valid by navigating to MMR
-            console.log('\n  → Testing injected cookies by navigating to mmr.manheim.com...');
+            // WARM UP: Visit www.manheim.com first (like the main scraper does)
+            // This activates the session cookies before hitting mmr.manheim.com's OAuth check
+            console.log('\n  → Warming up session on www.manheim.com first...');
+            await page.goto('https://www.manheim.com/', {
+                waitUntil: 'domcontentloaded',
+                timeout: 90000
+            });
+            console.log('  ✅ www.manheim.com loaded');
+            await humanDelay(3000, 5000);
+            await simulateHumanMouse(page);
+
+            // Now test if we can access MMR tool (the real auth check)
+            console.log('  → Now testing mmr.manheim.com...');
             await page.goto('https://mmr.manheim.com/', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
@@ -907,6 +933,12 @@ await Actor.main(async () => {
             } else if (testHostname === 'auth.manheim.com') {
                 // Cookies expired - need to login
                 console.log('  ⚠️ Cookies EXPIRED - redirected to auth page');
+
+                // Inject auth trust cookies before login (helps skip 2FA)
+                if (authTrustCookies.length > 0) {
+                    console.log(`  → Injecting ${authTrustCookies.length} auth trust cookies for device recognition...`);
+                    await context.addCookies(authTrustCookies);
+                }
 
                 if (!hasCredentials) {
                     const screenshot = await page.screenshot({ fullPage: false });
