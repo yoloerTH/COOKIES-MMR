@@ -22,7 +22,7 @@ const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
 // Stable browser fingerprint — must stay consistent across runs so
 // PingFederate's device recognition sees the same "device" every time.
 const DEFAULT_FINGERPRINT = {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
     viewport: { width: 1920, height: 1080 },
     screen: { width: 1920, height: 1080 },
     locale: 'en-CA',
@@ -65,23 +65,7 @@ async function restoreBrowserProfile() {
         // Clean up tarball
         fs.unlinkSync(PROFILE_TAR);
 
-        // CRITICAL: Delete the Cookies SQLite file from restored profile.
-        // Chromium's persistent context loads cookies from this file, but they're
-        // encrypted with the PREVIOUS container's key and can't be decrypted.
-        // This stale data conflicts with cookies we inject via addCookies().
-        // We manage cookies ourselves via KV store — don't need the SQLite file.
-        const cookiesDbPaths = [
-            path.join(PROFILE_DIR, 'Default', 'Cookies'),
-            path.join(PROFILE_DIR, 'Default', 'Cookies-journal'),
-        ];
-        for (const dbPath of cookiesDbPaths) {
-            if (fs.existsSync(dbPath)) {
-                fs.unlinkSync(dbPath);
-                console.log(`  → Deleted stale ${path.basename(dbPath)} from profile`);
-            }
-        }
-
-        console.log('  ✅ Browser profile restored from KV store (cookies DB cleaned)');
+        console.log('  ✅ Browser profile restored from KV store');
         return true;
     } catch (error) {
         console.log(`  ⚠️ Failed to restore profile: ${error.message}`);
@@ -191,16 +175,7 @@ async function getStableFingerprint() {
         const saved = await store.getValue(FINGERPRINT_KV_KEY);
 
         if (saved) {
-            // Check if saved fingerprint has outdated UA — if so, update it
-            if (saved.userAgent !== DEFAULT_FINGERPRINT.userAgent) {
-                console.log(`  → Saved fingerprint has outdated UA: ${saved.userAgent.substring(saved.userAgent.indexOf('Chrome'))}`);
-                console.log(`  → Updating to match main scraper: ${DEFAULT_FINGERPRINT.userAgent.substring(DEFAULT_FINGERPRINT.userAgent.indexOf('Chrome'))}`);
-                saved.userAgent = DEFAULT_FINGERPRINT.userAgent;
-                await store.setValue(FINGERPRINT_KV_KEY, saved);
-                console.log('  ✅ Fingerprint updated in KV store');
-            } else {
-                console.log('  ✅ Loaded fingerprint from KV store (consistent with previous runs)');
-            }
+            console.log('  ✅ Loaded fingerprint from KV store (consistent with previous runs)');
             console.log(`  → User-Agent: ${saved.userAgent.substring(saved.userAgent.indexOf('Chrome'))}`);
             console.log(`  → Viewport: ${saved.viewport.width}x${saved.viewport.height}`);
             console.log(`  → Locale: ${saved.locale} | TZ: ${saved.timezoneId}`);
@@ -803,7 +778,7 @@ await Actor.main(async () => {
     } else if (proxyConfiguration && proxyConfiguration.useApifyProxy) {
         // Extract session ID before passing to SDK (SDK doesn't accept it in the config object)
         const { apifyProxySessionId, ...proxyConfigClean } = proxyConfiguration;
-        const sessionId = apifyProxySessionId || 'manheim_sticky_1';
+        const sessionId = apifyProxySessionId || 'manheim-sticky-1';
 
         const proxyConfig = await Actor.createProxyConfiguration(proxyConfigClean);
         // Pass session ID to newUrl() — this pins us to a consistent IP
@@ -825,8 +800,8 @@ await Actor.main(async () => {
     // Restore browser profile from KV store (if available from previous run)
     const profileRestored = await restoreBrowserProfile();
 
-    // Launch browser + regular context (matching main scraper approach)
-    console.log('\n🌐 Launching browser context...');
+    // Launch PERSISTENT browser context (preserves cookies/storage between runs)
+    console.log('\n🌐 Launching persistent browser context...');
     console.log(`  → Profile: ${PROFILE_DIR} (${profileRestored ? 'restored from KV store' : 'fresh'})`);
 
     const contextOptions = {
@@ -850,23 +825,14 @@ await Actor.main(async () => {
         contextOptions.proxy = { server: proxyUrl };
     }
 
-    // Launch browser + regular context (NOT persistent context)
-    // Persistent context's internal cookie store conflicts with addCookies().
-    // We manage cookies ourselves via KV store — no need for persistent context.
-    const browser = await chromium.launch({
-        headless: true,
-        args: contextOptions.args,
-    });
-    delete contextOptions.args; // args go to launch(), not newContext()
-
-    const context = await browser.newContext(contextOptions);
+    const context = await chromium.launchPersistentContext(PROFILE_DIR, contextOptions);
 
     // Set default navigation timeout
     context.setDefaultNavigationTimeout(90000);
 
-    console.log('  ✅ Browser context ready');
+    console.log('  ✅ Persistent browser context ready');
 
-    // Check if profile already has cookies (won't have any in regular context)
+    // Check if profile already has cookies
     const existingCookies = await context.cookies();
     const hasExistingCookies = existingCookies.some(c =>
         c.name === '_cl' || c.name === 'SESSION'
@@ -876,35 +842,22 @@ await Actor.main(async () => {
         console.log(`\n🍪 Found ${existingCookies.length} existing cookies in browser profile`);
     }
 
-    // Inject cookies: input cookies > KV store cookies > credential login
-    // IMPORTANT: Inject ALL cookies including auth.manheim.com domain (PF.2, PF.PERSISTENT.2, etc.)
-    // These auth cookies are needed for the OAuth silent refresh — without them, the auth server
-    // can't recognize the device and will show a login page instead of silently redirecting back.
-    const ESSENTIAL_NAMES = ['_cl', 'SESSION', 'session', 'session.sig'];
+    // Inject cookies: input cookies > KV store cookies > profile cookies > credential login
     let hasCookiesInjected = false;
-    let hasAuthDomainCookies = false; // true if we have PF cookies for silent OAuth refresh
 
     if (manheimCookies && manheimCookies.length > 0) {
-        console.log(`\n🍪 Injecting ${manheimCookies.length} cookies from input...`);
+        console.log('\n🍪 Injecting fresh cookies from input...');
         await context.addCookies(manheimCookies);
-        const names = manheimCookies.map(c => c.name);
-        console.log(`  ✅ Injected: ${names.join(', ')}`);
-        hasAuthDomainCookies = manheimCookies.some(c => c.domain && c.domain.includes('auth.manheim.com'));
+        console.log(`  ✅ Injected ${manheimCookies.length} cookies from input`);
         hasCookiesInjected = true;
     } else {
         // Try to restore cookies from KV store (saved from last successful run)
         const savedCookies = await restoreSavedCookies();
         if (savedCookies && savedCookies.length > 0) {
-            // Inject ALL saved cookies (essential + auth domain + analytics)
-            // Auth domain cookies (PF.2, PF.PERSISTENT.2) enable silent OAuth refresh
-            console.log(`\n🍪 Injecting ALL ${savedCookies.length} saved cookies from KV store...`);
-            const authCookieCount = savedCookies.filter(c => c.domain && c.domain.includes('auth.manheim.com')).length;
-            const essentialCount = savedCookies.filter(c => ESSENTIAL_NAMES.includes(c.name)).length;
-            console.log(`  → ${essentialCount} essential + ${authCookieCount} auth domain + ${savedCookies.length - essentialCount - authCookieCount} other`);
+            console.log('\n🍪 Injecting saved cookies from KV store (last successful run)...');
             await context.addCookies(savedCookies);
-            console.log(`  ✅ All ${savedCookies.length} cookies injected`);
-            hasAuthDomainCookies = authCookieCount > 0;
-            hasCookiesInjected = essentialCount > 0;
+            console.log(`  ✅ Injected ${savedCookies.length} cookies from KV store`);
+            hasCookiesInjected = true;
         } else if (!hasExistingCookies && !credentials) {
             throw new Error('❌ No cookies (input/KV store/profile) and no credentials - cannot proceed');
         } else if (!hasExistingCookies) {
@@ -923,46 +876,24 @@ await Actor.main(async () => {
 
         const hasCredentials = credentials && credentials.username && credentials.password;
 
-        // Save original cookie values so we can compare after refresh
-        const originalCL = (await context.cookies()).find(c => c.name === '_cl')?.value;
-        const originalSESSION = (await context.cookies()).find(c => c.name === 'SESSION')?.value;
-
         if (hasCookiesInjected) {
             // Verify cookies are actually in the browser after injection
-            const verifyUrls = ['https://mmr.manheim.com', 'https://mcom-header-footer.manheim.com', 'https://auth.manheim.com'];
+            const verifyUrls = ['https://mmr.manheim.com', 'https://mcom-header-footer.manheim.com'];
             const verifyCookies = await context.cookies(verifyUrls);
-            const verifyEssential = verifyCookies.filter(c => ESSENTIAL_NAMES.includes(c.name));
-            const verifyAuth = verifyCookies.filter(c => c.domain && c.domain.includes('auth.manheim.com'));
+            const verifyEssential = verifyCookies.filter(c =>
+                ['_cl', 'SESSION', 'session', 'session.sig'].includes(c.name)
+            );
             console.log(`\n🔍 Cookie verification after injection:`);
             console.log(`  → Total cookies in browser: ${verifyCookies.length}`);
-            console.log(`  → Essential cookies: ${verifyEssential.length}/4`);
-            console.log(`  → Auth domain cookies: ${verifyAuth.length} (needed for silent OAuth refresh)`);
+            console.log(`  → Essential cookies found: ${verifyEssential.length}/4`);
             verifyEssential.forEach(c => {
                 console.log(`     • ${c.name.padEnd(15)} → ${c.domain.padEnd(35)} expires: ${c.expires === -1 ? 'session' : new Date(c.expires * 1000).toISOString()}`);
             });
 
-            // WARM UP: Visit www.manheim.com first (like the main scraper does)
-            console.log('\n  → Warming up session on www.manheim.com first...');
-            await page.goto('https://www.manheim.com/', {
-                waitUntil: 'domcontentloaded',
-                timeout: 90000
-            });
-            console.log('  ✅ www.manheim.com loaded');
-            await humanDelay(3000, 5000);
-            await simulateHumanMouse(page);
-
-            // TRIGGER OAuth REFRESH: Navigate to mmr.manheim.com ROOT (NOT /ui-mmr/).
-            // The root URL triggers a server-side OAuth redirect:
-            //   mmr.manheim.com/ → auth.manheim.com → (silent redirect if PF session valid) → mmr.manheim.com/oauth/callback
-            // The callback issues FRESH _cl + SESSION cookies. This is how cookies get REFRESHED.
-            // The /ui-mmr/ path validates client-side only and does NOT trigger server-side token refresh.
-            console.log('\n  → Triggering OAuth refresh via mmr.manheim.com/ (root)...');
-            console.log('  → This triggers: mmr → auth (PF check) → callback (new tokens) → mmr');
-            if (!hasAuthDomainCookies) {
-                console.log('  ⚠️ No auth domain cookies (PF.2, etc.) — silent refresh may not work');
-            }
+            // COOKIES PATH: Test if injected cookies are still valid by navigating to MMR
+            console.log('\n  → Testing injected cookies by navigating to mmr.manheim.com...');
             await page.goto('https://mmr.manheim.com/', {
-                waitUntil: 'load', // wait for full redirect chain to complete
+                waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
             await humanDelay(3000, 5000);
@@ -971,12 +902,11 @@ await Actor.main(async () => {
             console.log(`  → Landed on: ${testHostname} (${page.url().substring(0, 80)}...)`);
 
             if (testHostname === 'mmr.manheim.com') {
-                // OAuth redirect chain completed! New cookies issued by the callback.
-                console.log('  ✅ OAuth refresh SUCCEEDED — fresh cookies issued!');
+                // Cookies are valid! Session is still active
+                console.log('  ✅ Cookies are VALID - session still active, no login needed!');
             } else if (testHostname === 'auth.manheim.com') {
-                // Auth server couldn't do silent refresh (PF session expired or missing PF cookies)
-                console.log('  ⚠️ OAuth silent refresh failed — auth page shown');
-                console.log('  → This means PF session is expired or auth cookies are missing');
+                // Cookies expired - need to login
+                console.log('  ⚠️ Cookies EXPIRED - redirected to auth page');
 
                 if (!hasCredentials) {
                     const screenshot = await page.screenshot({ fullPage: false });
@@ -1008,7 +938,7 @@ await Actor.main(async () => {
         } else if (hasCredentials) {
             // CREDENTIALS PATH: Navigate to MMR tool to trigger OAuth redirect
             console.log('  → No cookies provided. Navigating to MMR tool to trigger auth flow...');
-            await page.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
+            await page.goto('https://mmr.manheim.com/', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
@@ -1044,23 +974,6 @@ await Actor.main(async () => {
             }
         } else {
             throw new Error('No cookies and no credentials provided - cannot proceed');
-        }
-
-        // Check if cookies were actually refreshed (new values issued by OAuth callback)
-        const postRefreshCookies = await context.cookies();
-        const newCL = postRefreshCookies.find(c => c.name === '_cl')?.value;
-        const newSESSION = postRefreshCookies.find(c => c.name === 'SESSION')?.value;
-
-        console.log('\n🔄 Cookie refresh check:');
-        if (newCL !== originalCL) {
-            console.log(`  ✅ _cl REFRESHED (value changed)`);
-        } else {
-            console.log(`  ⚠️ _cl unchanged (same value as input)`);
-        }
-        if (newSESSION !== originalSESSION) {
-            console.log(`  ✅ SESSION REFRESHED (value changed)`);
-        } else {
-            console.log(`  ⚠️ SESSION unchanged (same value as input)`);
         }
 
         console.log('✅ STEP 1 complete - authentication handled');
@@ -1320,8 +1233,8 @@ await Actor.main(async () => {
 
         // Now navigate to MMR tool on the MAIN page (not popup)
         console.log('  → Navigating to MMR tool on main page...');
-        console.log('  → URL: https://mmr.manheim.com/ui-mmr/?country=US&source=man');
-        await page.goto('https://mmr.manheim.com/ui-mmr/?country=US&source=man', {
+        console.log('  → URL: https://mmr.manheim.com/?country=US&source=man');
+        await page.goto('https://mmr.manheim.com/?country=US&source=man', {
             waitUntil: 'domcontentloaded',
             timeout: 90000
         });
@@ -1692,9 +1605,8 @@ await Actor.main(async () => {
 
         throw error;
     } finally {
-        // Close browser
+        // Close browser FIRST so profile files are flushed to disk
         await context.close();
-        await browser.close().catch(() => {});
 
         // Small delay to ensure all profile files are fully written
         await new Promise(r => setTimeout(r, 2000));
