@@ -22,7 +22,7 @@ const PROFILE_TAR = '/tmp/browser-profile.tar.gz';
 // Stable browser fingerprint — must stay consistent across runs so
 // PingFederate's device recognition sees the same "device" every time.
 const DEFAULT_FINGERPRINT = {
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     viewport: { width: 1920, height: 1080 },
     screen: { width: 1920, height: 1080 },
     locale: 'en-CA',
@@ -816,8 +816,8 @@ await Actor.main(async () => {
     // Restore browser profile from KV store (if available from previous run)
     const profileRestored = await restoreBrowserProfile();
 
-    // Launch PERSISTENT browser context (preserves cookies/storage between runs)
-    console.log('\n🌐 Launching persistent browser context...');
+    // Launch browser + regular context (matching main scraper approach)
+    console.log('\n🌐 Launching browser context...');
     console.log(`  → Profile: ${PROFILE_DIR} (${profileRestored ? 'restored from KV store' : 'fresh'})`);
 
     const contextOptions = {
@@ -941,9 +941,9 @@ await Actor.main(async () => {
             await humanDelay(3000, 5000);
             await simulateHumanMouse(page);
 
-            // Now test if we can access MMR tool (the real auth check)
-            console.log('  → Now testing mmr.manheim.com...');
-            await page.goto('https://mmr.manheim.com/', {
+            // Now test if we can access MMR tool (use /ui-mmr/ path like main scraper — root / has stricter OAuth gate)
+            console.log('  → Now testing mmr.manheim.com/ui-mmr/...');
+            await page.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
@@ -995,7 +995,7 @@ await Actor.main(async () => {
         } else if (hasCredentials) {
             // CREDENTIALS PATH: Navigate to MMR tool to trigger OAuth redirect
             console.log('  → No cookies provided. Navigating to MMR tool to trigger auth flow...');
-            await page.goto('https://mmr.manheim.com/', {
+            await page.goto('https://mmr.manheim.com/ui-mmr/?country=US&popup=true&source=man', {
                 waitUntil: 'domcontentloaded',
                 timeout: 90000
             });
