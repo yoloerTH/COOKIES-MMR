@@ -841,14 +841,23 @@ await Actor.main(async () => {
         contextOptions.proxy = { server: proxyUrl };
     }
 
-    const context = await chromium.launchPersistentContext(PROFILE_DIR, contextOptions);
+    // Launch browser + regular context (NOT persistent context)
+    // Persistent context's internal cookie store conflicts with addCookies().
+    // We manage cookies ourselves via KV store — no need for persistent context.
+    const browser = await chromium.launch({
+        headless: true,
+        args: contextOptions.args,
+    });
+    delete contextOptions.args; // args go to launch(), not newContext()
+
+    const context = await browser.newContext(contextOptions);
 
     // Set default navigation timeout
     context.setDefaultNavigationTimeout(90000);
 
-    console.log('  ✅ Persistent browser context ready');
+    console.log('  ✅ Browser context ready');
 
-    // Check if profile already has cookies
+    // Check if profile already has cookies (won't have any in regular context)
     const existingCookies = await context.cookies();
     const hasExistingCookies = existingCookies.some(c =>
         c.name === '_cl' || c.name === 'SESSION'
@@ -1653,8 +1662,9 @@ await Actor.main(async () => {
 
         throw error;
     } finally {
-        // Close browser FIRST so profile files are flushed to disk
+        // Close browser
         await context.close();
+        await browser.close().catch(() => {});
 
         // Small delay to ensure all profile files are fully written
         await new Promise(r => setTimeout(r, 2000));
