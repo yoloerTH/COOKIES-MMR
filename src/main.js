@@ -65,7 +65,23 @@ async function restoreBrowserProfile() {
         // Clean up tarball
         fs.unlinkSync(PROFILE_TAR);
 
-        console.log('  ✅ Browser profile restored from KV store');
+        // CRITICAL: Delete the Cookies SQLite file from restored profile.
+        // Chromium's persistent context loads cookies from this file, but they're
+        // encrypted with the PREVIOUS container's key and can't be decrypted.
+        // This stale data conflicts with cookies we inject via addCookies().
+        // We manage cookies ourselves via KV store — don't need the SQLite file.
+        const cookiesDbPaths = [
+            path.join(PROFILE_DIR, 'Default', 'Cookies'),
+            path.join(PROFILE_DIR, 'Default', 'Cookies-journal'),
+        ];
+        for (const dbPath of cookiesDbPaths) {
+            if (fs.existsSync(dbPath)) {
+                fs.unlinkSync(dbPath);
+                console.log(`  → Deleted stale ${path.basename(dbPath)} from profile`);
+            }
+        }
+
+        console.log('  ✅ Browser profile restored from KV store (cookies DB cleaned)');
         return true;
     } catch (error) {
         console.log(`  ⚠️ Failed to restore profile: ${error.message}`);
