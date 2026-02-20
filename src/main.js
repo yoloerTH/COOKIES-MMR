@@ -638,6 +638,59 @@ async function handleLoginFlow(page, credentials, twoFactorWebhookUrl) {
 }
 
 // ============================================
+// PINGFEDERATE DEVICE TRUST
+// ============================================
+
+async function visitAuthForDeviceTrust(context, label = 'Check-in') {
+    console.log(`\n🔐 ${label}: Visiting auth.manheim.com for PingFederate device recognition...`);
+    let trustPage = null;
+    try {
+        trustPage = await context.newPage();
+
+        // Navigate to auth.manheim.com — PingFederate's JS collects device signals
+        // (canvas fingerprint, WebGL, fonts, etc.) and writes them to localStorage/IndexedDB.
+        // The cookies (PF.PERSISTENT, pingone.risk.browser.profile) are sent automatically.
+        await trustPage.goto('https://auth.manheim.com/', {
+            waitUntil: 'domcontentloaded',
+            timeout: 15000
+        });
+
+        const trustHostname = getHostname(trustPage.url());
+        console.log(`  → Landed on: ${trustHostname} (${trustPage.url().substring(0, 80)}...)`);
+
+        // Wait for PingFederate JS to fully execute and write device recognition data
+        await humanDelay(3000, 5000);
+
+        // Check if PingFederate wrote anything to localStorage/IndexedDB
+        const trustData = await trustPage.evaluate(() => {
+            const lsKeys = Object.keys(localStorage);
+            return {
+                localStorageKeys: lsKeys,
+                localStorageCount: lsKeys.length
+            };
+        }).catch(() => ({ localStorageKeys: [], localStorageCount: 0 }));
+
+        if (trustData.localStorageCount > 0) {
+            console.log(`  → localStorage entries on auth page: ${trustData.localStorageCount}`);
+            console.log(`  → Keys: ${trustData.localStorageKeys.join(', ')}`);
+        } else {
+            console.log('  → No localStorage entries found on auth page (data may be in cookies/IndexedDB)');
+        }
+
+        // Extra wait to let any async writes complete
+        await humanDelay(1000, 2000);
+
+        console.log(`  ✅ ${label} complete — PingFederate device data should be in profile`);
+    } catch (error) {
+        console.log(`  ⚠️ ${label} failed: ${error.message} (non-critical, continuing)`);
+    } finally {
+        if (trustPage) {
+            await trustPage.close().catch(() => {});
+        }
+    }
+}
+
+// ============================================
 // CAPTCHA & ERROR DETECTION
 // ============================================
 
@@ -797,12 +850,49 @@ await Actor.main(async () => {
     // Load stable browser fingerprint (consistent across all runs)
     const fingerprint = await getStableFingerprint();
 
+    // Detect real Chromium version and sync fingerprint User-Agent to match.
+    // Playwright ships a specific Chromium build — if the UA string says a different
+    // Chrome version, PingFederate can detect the mismatch via JS APIs
+    // (navigator.userAgentData, feature detection) and flag it as suspicious.
+    console.log('\n🔍 Detecting real Chromium version...');
+    try {
+        const tempBrowser = await chromium.launch({ headless: true });
+        const realVersion = tempBrowser.version(); // e.g. "125.0.6422.26"
+        await tempBrowser.close();
+
+        const realMajor = realVersion.split('.')[0];
+        console.log(`  → Chromium binary version: ${realVersion} (major: ${realMajor})`);
+
+        // Extract current major version from fingerprint UA
+        const uaMatch = fingerprint.userAgent.match(/Chrome\/(\d+)/);
+        const currentMajor = uaMatch ? uaMatch[1] : null;
+        console.log(`  → Fingerprint UA version: Chrome/${currentMajor}`);
+
+        if (currentMajor !== realMajor) {
+            console.log(`  ⚠️ Version mismatch! Updating UA from Chrome/${currentMajor} to Chrome/${realMajor}`);
+            fingerprint.userAgent = fingerprint.userAgent.replace(
+                /Chrome\/\d+\.0\.0\.0/,
+                `Chrome/${realMajor}.0.0.0`
+            );
+
+            // Save corrected fingerprint to KV store so it stays in sync
+            const store = await Actor.openKeyValueStore(PROFILE_KV_STORE_NAME);
+            await store.setValue(FINGERPRINT_KV_KEY, fingerprint);
+            console.log(`  ✅ Fingerprint updated and saved: Chrome/${realMajor}.0.0.0`);
+        } else {
+            console.log('  ✅ Fingerprint UA matches Chromium binary — no update needed');
+        }
+    } catch (error) {
+        console.log(`  ⚠️ Could not detect Chromium version: ${error.message} — using existing fingerprint`);
+    }
+
     // Restore browser profile from KV store (if available from previous run)
     const profileRestored = await restoreBrowserProfile();
 
     // Launch PERSISTENT browser context (preserves cookies/storage between runs)
     console.log('\n🌐 Launching persistent browser context...');
     console.log(`  → Profile: ${PROFILE_DIR} (${profileRestored ? 'restored from KV store' : 'fresh'})`);
+    console.log(`  → User-Agent: ${fingerprint.userAgent.substring(fingerprint.userAgent.indexOf('Chrome'))}`);
 
     const contextOptions = {
         viewport: fingerprint.viewport,
@@ -814,7 +904,6 @@ await Actor.main(async () => {
         args: [
             '--disable-blink-features=AutomationControlled',
             '--disable-features=IsolateOrigins,site-per-process',
-            '--disable-web-security',
             `--window-size=${fingerprint.screen.width},${fingerprint.screen.height}`,
             '--lang=en-CA',
         ],
@@ -925,6 +1014,9 @@ await Actor.main(async () => {
                 await humanDelay(3000, 5000);
                 const postLoginHost = getHostname(page.url());
                 console.log(`  → Post-login hostname: ${postLoginHost}`);
+
+                // Build device trust after successful login
+                await visitAuthForDeviceTrust(context, 'Post-login trust build');
             } else {
                 // Unexpected page - check for CAPTCHA
                 console.log(`  ⚠️ Unexpected page: ${testHostname}`);
@@ -967,6 +1059,9 @@ await Actor.main(async () => {
                     throw new Error('Still on auth page after login - authentication may have failed');
                 }
                 console.log('  ✅ Login successful!');
+
+                // Build device trust after successful login
+                await visitAuthForDeviceTrust(context, 'Post-login trust build');
             } else if (landedHostname === 'mmr.manheim.com') {
                 console.log('  ✅ Already authenticated (browser profile has valid session)');
             } else {
@@ -977,6 +1072,11 @@ await Actor.main(async () => {
         }
 
         console.log('✅ STEP 1 complete - authentication handled');
+
+        // STEP 1.5: Check in with auth.manheim.com to keep device trust alive
+        // Even when no login is needed, this lets PingFederate see the "device"
+        // and refresh its recognition data in the browser profile.
+        await visitAuthForDeviceTrust(context, 'Device trust check-in');
 
         // STEP 2: Visit www.manheim.com to trigger mcom-header-footer iframe cookies
         // This is the KEY step for getting session + session.sig cookies
@@ -1175,6 +1275,9 @@ await Actor.main(async () => {
                     if (getHostname(urlAfterLogin) === 'auth.manheim.com') {
                         throw new Error('Still on auth page after login - authentication may have failed');
                     }
+
+                    // Build device trust after successful login
+                    await visitAuthForDeviceTrust(context, 'Post-login trust build');
                 } else {
                     console.log('  ✅ No login form detected - session may be valid');
                 }
